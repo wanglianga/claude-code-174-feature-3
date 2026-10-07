@@ -31,6 +31,10 @@
       </div>
       <el-alert v-if="a.blockingIssues?.length" type="error" show-icon :closable="false" style="margin-top:12px"
         :title="`存在 ${a.blockingIssues.length} 件阻断性问题未办结，相关环节被冻结：${a.blockingIssues.map(x=>ISSUE_TYPES[x.type]).join('、')}`" />
+      <el-alert v-for="ev in (a.activeRiskEvents||[])" :key="ev.id" type="warning" show-icon :closable="false" style="margin-top:10px"
+        :title="`暴雨风险事件 ${ev.code} 持续跟踪中（${EVENT_STATUS[ev.status]?.label}，当前${RISK[ev.riskLevel].label}，已上报${ev.reportCount}次）`">
+        <el-button size="small" type="primary" @click="$router.push(`/risk-events/${ev.id}`)">查看/分流处置</el-button>
+      </el-alert>
     </el-card>
 
     <el-card shadow="never" style="margin-top:12px">
@@ -45,6 +49,10 @@
               </el-card>
             </el-timeline-item>
           </el-timeline>
+        </el-tab-pane>
+
+        <el-tab-pane label="暴雨风险事件" name="rain">
+          <tab-rain :archive="a" @reload="load" />
         </el-tab-pane>
 
         <el-tab-pane label="复核与整改方案" name="review">
@@ -79,13 +87,14 @@
 import { onMounted, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import http from '../api';
-import { RISK, STATUS, ISSUE_TYPES, ACTIVITY_KIND, fmtDate } from '../labels';
+import { RISK, STATUS, ISSUE_TYPES, ACTIVITY_KIND, EVENT_STATUS, fmtDate } from '../labels';
 import TabReview from '../components/TabReview.vue';
 import TabNotice from '../components/TabNotice.vue';
 import TabIssues from '../components/TabIssues.vue';
 import TabConstruction from '../components/TabConstruction.vue';
 import TabSubsidy from '../components/TabSubsidy.vue';
 import TabAcceptance from '../components/TabAcceptance.vue';
+import TabRain from '../components/TabRainEvents.vue';
 
 const route = useRoute();
 const a = ref({});
@@ -97,6 +106,7 @@ function kindType(k) {
     INSPECTION: 'primary', REVIEW: 'primary', NOTICE: 'warning', EVACUATE: 'danger',
     PLAN: 'primary', SUBSIDY: 'warning', MATERIAL: 'danger', CONSTRUCTION: '',
     ACCEPTANCE: 'success', CLOSE: 'success', RECHECK: 'warning', ISSUE: 'danger', CONSULT: 'info',
+    RAINEVENT: 'danger',
   }[k] || '';
 }
 async function load() {

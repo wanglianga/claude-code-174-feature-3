@@ -11,6 +11,46 @@
       <el-col :span="6"><div class="kpi ok"><div class="num">{{ Math.round((d.closureRate || 0) * 100) }}%</div><div class="k">销号率（{{ d.closed }}/{{ d.totalHouses }}，反弹 {{ d.rebound }}）</div></div></el-col>
     </el-row>
 
+    <el-card shadow="never" style="margin-top:14px">
+      <template #header>
+        <div class="rain-head">
+          <span>连续暴雨后风险事件与跨部门处置（同屋反复上报合并为一条持续升级事件）</span>
+          <el-button link type="primary" @click="$router.push('/risk-events')">进入事件中心 →</el-button>
+        </div>
+      </template>
+      <el-row :gutter="14">
+        <el-col :span="6">
+          <div class="rain-stat"><div class="n danger">{{ d.rain?.activeEvents ?? 0 }}</div><div class="l">未闭环风险事件</div></div>
+        </el-col>
+        <el-col :span="6">
+          <div class="rain-stat"><div class="n warn">{{ d.rain?.evacuatingEvents ?? 0 }}</div><div class="l">已分流先转移（三方同办）</div></div>
+        </el-col>
+        <el-col :span="6">
+          <div class="rain-stat"><div class="n">{{ d.rain?.mergedReports ?? 0 }}</div><div class="l">三天内重复上报并入次数</div></div>
+        </el-col>
+        <el-col :span="6">
+          <div class="rain-stat"><div class="n ok">{{ d.rain?.noVisitCount ?? 0 }}</div><div class="l">系统筛选无需重新上门</div></div>
+        </el-col>
+      </el-row>
+      <el-row :gutter="14" style="margin-top:12px">
+        <el-col :span="12">
+          <el-table :data="deptRows" size="small" border>
+            <el-table-column label="责任方">
+              <template #default="{ row }"><el-tag size="small" :type="DISPATCH_DEPT[row.dept]?.type">{{ DISPATCH_DEPT[row.dept]?.label }}</el-tag></template>
+            </el-table-column>
+            <el-table-column prop="pending" label="待办任务" width="100" align="center" />
+            <el-table-column prop="done" label="已办结" width="100" align="center" />
+          </el-table>
+        </el-col>
+        <el-col :span="12">
+          <el-descriptions :column="1" size="small" border>
+            <el-descriptions-item label="民政临时安置">已办结 {{ d.rain?.civilAid?.settlementDone ?? 0 }} 户，合计 ¥{{ (d.rain?.civilAid?.settlementAmount || 0).toLocaleString() }}</el-descriptions-item>
+            <el-descriptions-item label="困难家庭修缮补助">已办结 {{ d.rain?.civilAid?.repairDone ?? 0 }} 户，合计 ¥{{ (d.rain?.civilAid?.repairAmount || 0).toLocaleString() }}（与住建补助并行）</el-descriptions-item>
+          </el-descriptions>
+        </el-col>
+      </el-row>
+    </el-card>
+
     <el-alert
       v-if="d.notStoppedHouses?.length"
       :title="`高风险尚未真正停用（${d.notStoppedHouses.length}栋）——存在人员继续居住/经营风险，需立即督办`"
@@ -120,13 +160,14 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue';
 import http from '../api';
-import { RISK, STATUS, ISSUE_TYPES, ITEM_TYPES } from '../labels';
+import { RISK, STATUS, ISSUE_TYPES, ITEM_TYPES, DISPATCH_DEPT } from '../labels';
 
 const d = ref({});
 const loading = ref(false);
 const pct = (v, t) => (t ? Math.round((v / t) * 100) : 0);
 const townshipRows = computed(() => Object.entries(d.value.byTownship || {}).map(([township, v]) => ({ township, ...v })));
 const issueRows = computed(() => Object.entries(d.value.issuesByType || {}).map(([k, v]) => ({ k, ...v })));
+const deptRows = computed(() => Object.entries(d.value.rain?.dispatchesByDept || {}).map(([dept, v]) => ({ dept, ...v })));
 
 onMounted(async () => {
   loading.value = true;
@@ -148,4 +189,9 @@ onMounted(async () => {
 .bar-label { width:78px; flex:none; text-align:center; }
 .bar-text { width:110px; flex:none; font-size:13px; color:#445; }
 .money { color:#f56c6c; }
+.rain-head { display:flex; justify-content:space-between; align-items:center; }
+.rain-stat { text-align:center; background:#f7f9fc; border-radius:8px; padding:14px 8px; }
+.rain-stat .n { font-size:26px; font-weight:700; }
+.rain-stat .n.danger { color:#f56c6c; } .rain-stat .n.warn { color:#e6a23c; } .rain-stat .n.ok { color:#67c23a; }
+.rain-stat .l { color:#7a8899; font-size:12px; margin-top:4px; }
 </style>

@@ -36,8 +36,10 @@ const form = reactive({ username: 'county1', password: '123456' });
 const loading = ref(false);
 const accounts = [
   { u: 'county1', label: '县级', type: 'danger' },
-  { u: 'town1', label: '乡镇', type: 'warning' },
+  { u: 'town1', label: '乡镇住建', type: 'warning' },
   { u: 'grid1', label: '网格员', type: 'success' },
+  { u: 'cadre1', label: '村干部', type: 'warning' },
+  { u: 'civil1', label: '民政', type: 'success' },
   { u: 'acceptor1', label: '验收员', type: 'primary' },
   { u: 'farmer1', label: '农户', type: 'info' },
   { u: 'team1', label: '施工队', type: '' },

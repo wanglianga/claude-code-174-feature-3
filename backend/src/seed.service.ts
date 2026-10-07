@@ -17,6 +17,7 @@ import {
   UserRole,
 } from './entities';
 import { AppService, CurrentUser } from './app.service';
+import { RainService } from './rain.service';
 import { hashPassword } from './auth.controller';
 
 @Injectable()
@@ -26,6 +27,7 @@ export class SeedService implements OnApplicationBootstrap {
     @InjectRepository(User) private users: Repository<User>,
     @InjectRepository(ConstructionTeam) private teams: Repository<ConstructionTeam>,
     private svc: AppService,
+    private rain: RainService,
   ) {}
 
   async onApplicationBootstrap() {
@@ -104,6 +106,15 @@ export class SeedService implements OnApplicationBootstrap {
       }),
     );
     const teamUser = await this.mkUser('team1', '钱工（安泰施工队）', UserRole.TEAM, undefined, teamA.id);
+
+    // 村干部（三乡镇各一）与民政（三乡镇各一）
+    const cadre1 = await this.mkUser('cadre1', '何平（溪口村干部）', UserRole.CADRE, '溪口镇');
+    const cadre2 = await this.mkUser('cadre2', '罗大山（云岭村干部）', UserRole.CADRE, '云岭乡');
+    const cadre3 = await this.mkUser('cadre3', '何平（青山村支书）', UserRole.CADRE, '青山镇');
+    const civil1 = await this.mkUser('civil1', '林民政（溪口民政所）', UserRole.CIVIL_ADMIN, '溪口镇');
+    const civil2 = await this.mkUser('civil2', '温民政（云岭民政所）', UserRole.CIVIL_ADMIN, '云岭乡');
+    const civil3 = await this.mkUser('civil3', '安民政（青山民政所）', UserRole.CIVIL_ADMIN, '青山镇');
+    void cadre2; void civil2;
 
     // ---------- 房屋A：全流程已销号，补助已发，复查通过 ----------
     {
@@ -419,5 +430,158 @@ export class SeedService implements OnApplicationBootstrap {
     }
 
     void teamB;
+
+    // ---------- 房屋G：整改期暴雨后沉降升级至转移级，困难家庭，三方任务自动派发 ----------
+    {
+      const insp = await this.svc.createInspection(grid1, {
+        code: 'NF-XK-000007',
+        township: '溪口镇', village: '双溪村', address: '双溪村后山脚9号',
+        ownerName: '赵桂兰', ownerPhone: '13811110007',
+        buildYear: 1978, floors: 2, usage: '自住',
+        wallCrack: 1, roofLeak: 1, foundationSettlement: 1, residents: 2,
+        notes: '土坯墙老房，后墙明显裂缝、房前地面有沉降迹象，户内两名老人',
+      });
+      const houseId = insp.house.id;
+      await this.svc.createReview(town1, {
+        inspectionId: insp.inspection.id, decision: RiskLevel.SUSPEND,
+        requirement: '加固后墙与地基，修复屋面，设置警示，雨季前完成主体加固。',
+        deadline: this.dateStr(25),
+        items: [
+          { type: 'REINFORCE_WALL', description: '后墙及地基加固处理' },
+          { type: 'REPAIR_ROOF', description: '屋面局部防水修补' },
+          { type: 'SET_WARNING', description: '房后边坡一侧设置警示' },
+        ],
+      });
+      await this.svc.createNotice(grid1, {
+        houseId, method: '书面送达', notifiedTo: ['户主赵桂兰'], acknowledged: true,
+      });
+      await this.svc.confirmStopUse(grid1, houseId, { confirmed: true, remark: '后墙拉警戒线' });
+      await this.svc.upsertFamily(houseId, {
+        difficultyType: DifficultyType.LOW_INCOME,
+        difficultyProof: ['/uploads/demo-dibao-g.jpg'],
+        ownershipProof: ['/uploads/demo-quanshu-g.jpg'],
+        ownerConsent: true,
+        membersNote: '低保户，户内两名70岁以上老人，其中一人行动不便，无自有搬离能力',
+      });
+      await this.svc.submitConstructionPlan(farmer1, {
+        houseId, teamId: teamA.id, startDate: this.dateStr(1), endDate: this.dateStr(20),
+        budgetItems: [
+          { name: '商品混凝土', spec: 'C30', qty: 10, unit: 'm³', unitPrice: 480 },
+          { name: '钢筋', spec: 'HRB400 12mm', qty: 1.5, unit: '吨', unitPrice: 4600 },
+          { name: '防水卷材', spec: 'SBS 4mm', qty: 40, unit: '㎡', unitPrice: 45 },
+        ],
+      });
+
+      // 连续暴雨后：裂缝明显→严重、沉降明显→严重，研判升级紧急转移，自动派发三方任务
+      const t0 = this.daysFromNow(0);
+      const r1 = await this.rain.submitReport(grid1, {
+        houseId, reportedAt: t0.toISOString(),
+        wallCrack: 2, roofLeak: 2, foundationSettlement: 2, residentsAtSite: 2,
+        note: '一夜暴雨后后墙新增斜向贯通裂缝，房前地面塌陷约2厘米，老人仍在屋内',
+      });
+      // 住建分流：先安排人员转移
+      await this.rain.triage(town1, r1.event.id, {
+        decision: 'EVACUATE',
+        note: '沉降发展快，先转人再加固，原已采购材料与已设警示保留',
+      });
+      // 村干部完成转移组织；民政完成临时安置（自动生成转移安置记录，金额留痕）
+      const detail = await this.rain.eventDetail(r1.event.id);
+      const cadreTask = detail.dispatches.find((d) => d.dept === 'CADRE' && d.kind === 'EVACUATE_ORGANIZE');
+      const civilSettleTask = detail.dispatches.find((d) => d.dept === 'CIVIL' && d.kind === 'TEMP_SETTLEMENT');
+      await this.rain.completeTask(cadre1, cadreTask.id, {
+        result: '村干部上门背出行动不便老人，2人转至村部安置点，房屋张贴封条并安排党员轮值盯守',
+      });
+      await this.rain.completeTask(civil1, civilSettleTask.id, {
+        result: '落实村部安置点床位与被褥，发放过渡期生活物资',
+        residents: 2, destination: '溪口村部安置点', amount: 2000,
+      });
+      // 住建加固处置、复查销号任务与民政修缮补助任务保持未完成 → 销号闸口演示
+    }
+
+    // ---------- 房屋H：整改期三天内三次反复上报，聚合同一事件，分流延长整改 ----------
+    {
+      const insp = await this.svc.createInspection(grid2, {
+        code: 'NF-YL-000008',
+        township: '云岭乡', village: '石坎村', address: '石坎村三组',
+        ownerName: '孙长顺', ownerPhone: '13811110008',
+        buildYear: 2008, floors: 2, usage: '自住',
+        wallCrack: 1, roofLeak: 1, foundationSettlement: 0, residents: 3,
+        notes: '横墙有明显裂缝，屋面局部渗漏，已列入限期整改',
+      });
+      const houseId = insp.house.id;
+      await this.svc.createReview(town2, {
+        inspectionId: insp.inspection.id, decision: RiskLevel.RECTIFY,
+        requirement: '加固横墙，重做屋面防水。',
+        deadline: this.dateStr(20),
+        items: [
+          { type: 'REINFORCE_WALL', description: '横墙钢筋网抹面加固' },
+          { type: 'REPAIR_ROOF', description: '屋面防水翻新' },
+        ],
+      });
+      await this.svc.createNotice(grid2, {
+        houseId, method: '现场告知', notifiedTo: ['户主孙长顺'], acknowledged: true,
+      });
+      await this.svc.upsertFamily(houseId, {
+        difficultyType: DifficultyType.NONE, ownershipType: '自有（宅基地）',
+        ownershipProof: ['/uploads/demo-quanshu-h.jpg'], ownerConsent: true,
+      });
+      await this.svc.submitConstructionPlan(farmer2, {
+        houseId, teamId: teamA.id, startDate: this.dateStr(1), endDate: this.dateStr(16),
+        budgetItems: [
+          { name: '防水卷材', spec: 'SBS 4mm', qty: 80, unit: '㎡', unitPrice: 45 },
+        ],
+      });
+
+      const base = this.daysFromNow(0);
+      const p1 = await this.rain.submitReport(grid2, {
+        houseId, reportedAt: new Date(base.getTime() + 2 * 3600000).toISOString(),
+        wallCrack: 1, roofLeak: 2, foundationSettlement: 0, residentsAtSite: 3,
+        note: '暴雨后屋面渗漏加重成多处漏水',
+      });
+      const p2 = await this.rain.submitReport(grid2, {
+        houseId, reportedAt: new Date(base.getTime() + 6 * 3600000).toISOString(),
+        wallCrack: 1, roofLeak: 2, foundationSettlement: 0, residentsAtSite: 3,
+        note: '雨未停，渗漏依旧，户主再次电话上报',
+      });
+      const p3 = await this.rain.submitReport(grid2, {
+        houseId, reportedAt: new Date(base.getTime() + 2 * 86400000).toISOString(),
+        wallCrack: 1, roofLeak: 2, foundationSettlement: 1, residentsAtSite: 3,
+        note: '第三天复测，墙脚出现明显沉降迹象',
+      });
+      void p1; void p2; void p3;
+      // 住建分流：延长整改期限（原状态与已完成工序不重置）
+      await this.rain.triage(town2, p3.event.id, {
+        decision: 'EXTEND', newDeadline: this.dateStr(38),
+        note: '新增沉降需补做地基处理，在原方案上加项，工期顺延18天',
+      });
+    }
+
+    // ---------- 房屋I：整改期暴雨后上报，系统筛选无需重新上门 ----------
+    {
+      const insp = await this.svc.createInspection(grid3, {
+        code: 'NF-QS-000009',
+        township: '青山镇', village: '柳湾村', address: '柳湾村二组',
+        ownerName: '周小梅', ownerPhone: '13811110009',
+        buildYear: 2013, floors: 2, usage: '自住',
+        wallCrack: 0, roofLeak: 1, foundationSettlement: 0, residents: 3,
+        notes: '屋面局部小范围渗水，已列入限期整改修屋面',
+      });
+      const houseId = insp.house.id;
+      await this.svc.createReview(town3, {
+        inspectionId: insp.inspection.id, decision: RiskLevel.RECTIFY,
+        requirement: '修复屋面局部防水层。',
+        deadline: this.dateStr(22),
+        items: [{ type: 'REPAIR_ROOF', description: '局部屋面防水修补' }],
+      });
+      await this.svc.createNotice(grid3, {
+        houseId, method: '现场告知', notifiedTo: ['户主周小梅'], acknowledged: true,
+      });
+      const screened = await this.rain.submitReport(grid3, {
+        houseId, reportedAt: this.daysFromNow(0).toISOString(),
+        wallCrack: 0, roofLeak: 1, foundationSettlement: 0, residentsAtSite: 3,
+        note: '暴雨后仍只有原位置局部渗水，无新增裂缝沉降，不影响按原计划施工',
+      });
+      if (screened.needVisit) throw new Error('房屋I场景应被筛选为无需上门');
+    }
   }
 }

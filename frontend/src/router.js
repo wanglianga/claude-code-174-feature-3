@@ -9,6 +9,10 @@ const routes = [
   { path: '/houses/:id', component: () => import('./views/HouseDetail.vue') },
   { path: '/inspect', component: () => import('./views/NewInspection.vue') },
   { path: '/teams', component: () => import('./views/Teams.vue') },
+  { path: '/rain-report', component: () => import('./views/RainReport.vue') },
+  { path: '/risk-events', component: () => import('./views/RiskEvents.vue') },
+  { path: '/risk-events/:id', component: () => import('./views/RiskEventDetail.vue') },
+  { path: '/my-tasks', component: () => import('./views/MyTasks.vue') },
 ];
 
 const router = createRouter({ history: createWebHashHistory(), routes });

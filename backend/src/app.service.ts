@@ -23,9 +23,12 @@ import {
   IssueType,
   ItemStatus,
   NoticeRecord,
+  RainReport,
+  RectificationExtension,
   RectificationItem,
   RecheckRecord,
   ReviewPlan,
+  RiskEvent,
   RiskLevel,
   Stakeholder,
   SubsidyApplication,
@@ -33,6 +36,7 @@ import {
   User,
 } from './entities';
 import { evaluateRisk } from './risk.rules';
+import { RainService } from './rain.service';
 
 const SUBSIDY_RATE = 0.7; // 补助不超过核定预算的70%
 const SUBSIDY_CAP = 50000; // 每户最高补助5万元
@@ -70,6 +74,10 @@ export class AppService {
     @InjectRepository(RecheckRecord) private rechecks: Repository<RecheckRecord>,
     @InjectRepository(HouseActivity) private activities: Repository<HouseActivity>,
     @InjectRepository(User) private users: Repository<User>,
+    @InjectRepository(RiskEvent) private riskEvents: Repository<RiskEvent>,
+    @InjectRepository(RainReport) private rainReports: Repository<RainReport>,
+    @InjectRepository(RectificationExtension) private extensions: Repository<RectificationExtension>,
+    private rain: RainService,
     private dataSource: DataSource,
   ) {}
 
@@ -878,8 +886,10 @@ export class AppService {
     if (!body.confirmedAllItems) throw new BadRequestException('须逐项确认整改方案全部完成');
     if (!body.confirmedStopUseLifted) throw new BadRequestException('须确认房屋安全恢复、停用/警示措施按方案处理');
     await this.assertNoBlocking(house.id, '销号');
+    // 暴雨风险事件：三方处置任务未全部办结不得销号
+    await this.rain.assertTasksDoneForClose(house.id);
 
-    return this.dataSource.transaction(async (m) => {
+    await this.dataSource.transaction(async (m) => {
       await m.save(
         m.create(CloseRecord, {
           houseId: house.id,
@@ -908,6 +918,9 @@ export class AppService {
       );
       return { ok: true };
     });
+    // 复查合格后销号：关闭未闭环暴雨风险事件，风险等级恢复正常
+    await this.rain.closeEventsForHouse(house.id, u, body.remark);
+    return { ok: true };
   }
 
   // ---------- 复查 ----------
@@ -915,7 +928,7 @@ export class AppService {
     const house = await this.getHouseOrFail(body.houseId);
     if (house.status !== HouseStatus.CLOSED) throw new BadRequestException('仅已销号房屋需要复查');
     const result: AcceptanceResult = body.result;
-    return this.dataSource.transaction(async (m) => {
+    await this.dataSource.transaction(async (m) => {
       await m.save(
         m.create(RecheckRecord, {
           houseId: house.id,
@@ -960,6 +973,12 @@ export class AppService {
       );
       return { ok: true };
     });
+    // 复查反弹：把本次变化接回风险事件流（与暴雨上报同一套持续升级事件）
+    if (result === AcceptanceResult.FAIL) {
+      const fresh = await this.getHouseOrFail(body.houseId);
+      await this.rain.openReboundEvent(u, fresh, body);
+    }
+    return { ok: true };
   }
 
   // ---------- 房屋档案聚合 ----------
@@ -980,6 +999,7 @@ export class AppService {
     const [
       inspections, plans, notices, evacuations, stakeholders, consultations, issues,
       family, cplan, subsidy, logs, acceptances, close, rechecks, activities,
+      riskEvents, rainReports, extensions,
     ] = await Promise.all([
       this.inspections.find({ where: { houseId: id }, order: { inspectedAt: 'DESC' } }),
       this.plans.find({ where: { houseId: id }, order: { reviewedAt: 'DESC' }, relations: ['items'] }),
@@ -996,11 +1016,16 @@ export class AppService {
       this.closes.findOne({ where: { houseId: id } }),
       this.rechecks.find({ where: { houseId: id }, order: { checkedAt: 'DESC' } }),
       this.activities.find({ where: { houseId: id }, order: { createdAt: 'DESC' }, take: 200 }),
+      this.riskEvents.find({ where: { houseId: id }, order: { lastReportAt: 'DESC' } }),
+      this.rainReports.find({ where: { houseId: id }, order: { reportedAt: 'DESC' } }),
+      this.extensions.find({ where: { houseId: id }, order: { createdAt: 'DESC' } }),
     ]);
     const blockingIssues = issues.filter((i) => i.blocksWorkflow && i.status !== IssueStatus.RESOLVED);
+    const activeRiskEvents = riskEvents.filter((e: any) => e.status !== 'CLOSED');
     return {
       house, inspections, plans, notices, evacuations, stakeholders, consultations, issues, blockingIssues,
       family, constructionPlan: cplan, subsidy, constructionLogs: logs, acceptances, close, rechecks, activities,
+      riskEvents, rainReports, extensions, activeRiskEvents,
     };
   }
 
@@ -1104,6 +1129,7 @@ export class AppService {
       subsidySummary,
       itemByType,
       closureRate: houses.length ? Number((closed / houses.length).toFixed(2)) : 0,
+      rain: await this.rain.stats(township),
     };
   }
 }

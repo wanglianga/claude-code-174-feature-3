@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
 import { JwtModule } from '@nestjs/jwt';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { APP_GUARD } from '@nestjs/core';
 import {
   Acceptance,
   AcceptanceItemResult,
@@ -11,6 +11,7 @@ import {
   ConstructionPlan,
   ConstructionTeam,
   Consultation,
+  DispatchTask,
   EvacuationRecord,
   FamilyProfile,
   House,
@@ -18,9 +19,12 @@ import {
   Inspection,
   IssueRecord,
   NoticeRecord,
+  RainReport,
+  RectificationExtension,
   RectificationItem,
   RecheckRecord,
   ReviewPlan,
+  RiskEvent,
   Stakeholder,
   SubsidyApplication,
   User,
@@ -30,12 +34,15 @@ import { AppController } from './app.controller';
 import { AuthController } from './auth.controller';
 import { AuthGuard } from './auth.guard';
 import { SeedService } from './seed.service';
+import { RainService } from './rain.service';
+import { RainController } from './rain.controller';
 
 const entities = [
   User, House, Inspection, ReviewPlan, RectificationItem, NoticeRecord, EvacuationRecord,
   Stakeholder, Consultation, IssueRecord, FamilyProfile, ConstructionTeam, ConstructionPlan,
   BudgetItem, SubsidyApplication, ConstructionLog, Acceptance, AcceptanceItemResult,
   CloseRecord, RecheckRecord, HouseActivity,
+  RainReport, RiskEvent, DispatchTask, RectificationExtension,
 ];
 
 @Module({
@@ -57,9 +64,10 @@ const entities = [
       signOptions: { expiresIn: '12h' },
     }),
   ],
-  controllers: [AuthController, AppController],
+  controllers: [AuthController, AppController, RainController],
   providers: [
     AppService,
+    RainService,
     SeedService,
     { provide: APP_GUARD, useClass: AuthGuard },
   ],

@@ -90,6 +90,42 @@ export const ROLE_LABELS = {
   FARMER: '农户',
   TEAM: '施工队',
   ACCEPTOR: '验收人员',
+  CADRE: '村干部',
+  CIVIL_ADMIN: '民政',
+};
+
+export const EVENT_STATUS = {
+  ACTIVE: { label: '持续跟踪中', type: 'danger' },
+  TRIAGED: { label: '已分流·继续原计划', type: 'primary' },
+  EXTENDED: { label: '已分流·延长整改', type: 'warning' },
+  EVACUATING: { label: '已分流·先转移', type: 'danger' },
+  CLOSED: { label: '已闭环', type: 'success' },
+};
+
+export const TRIAGE = {
+  CONTINUE: { label: '继续原整改计划', type: 'primary' },
+  EXTEND: { label: '延长整改期限', type: 'warning' },
+  EVACUATE: { label: '先安排人员转移', type: 'danger' },
+};
+
+export const DISPATCH_DEPT = {
+  CADRE: { label: '村干部', type: 'warning' },
+  HOUSING: { label: '住建', type: 'primary' },
+  CIVIL: { label: '民政', type: 'success' },
+};
+
+export const DISPATCH_KIND = {
+  EVACUATE_ORGANIZE: '组织转移并现场盯守',
+  TEMP_SETTLEMENT: '临时安置与生活保障',
+  REPAIR_SUBSIDY: '困难家庭修缮补助/救助',
+  RECTIFY_ADJUST: '房屋紧急处置与方案调整',
+  RECHECK_CLOSE: '复查合格后销号闭环',
+  MONITOR: '雨期加密巡查监测',
+};
+
+export const DISPATCH_STATUS = {
+  PENDING: { label: '待办', type: 'danger' },
+  DONE: { label: '已办结', type: 'success' },
 };
 
 export const ACTIVITY_KIND = {
@@ -106,6 +142,7 @@ export const ACTIVITY_KIND = {
   RECHECK: '复查',
   ISSUE: '异常',
   CONSULT: '协商',
+  RAINEVENT: '暴雨风险事件',
 };
 
 export const fmtDate = (s) => (s ? new Date(s).toLocaleString('zh-CN', { hour12: false }) : '—');
