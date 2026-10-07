@@ -16,6 +16,8 @@ export enum UserRole {
   FARMER = 'FARMER', // 农户
   TEAM = 'TEAM', // 施工队
   ACCEPTOR = 'ACCEPTOR', // 验收人员
+  CADRE = 'CADRE', // 村干部
+  CIVIL_AFFAIRS = 'CIVIL_AFFAIRS', // 民政
 }
 
 export enum RiskLevel {
@@ -63,6 +65,7 @@ export enum IssueType {
   TENANT_REFUSE = 'TENANT_REFUSE', // 租户不愿搬离
   ACCEPTANCE_FAIL = 'ACCEPTANCE_FAIL', // 验收不通过
   REBOUND = 'REBOUND', // 复查发现问题反弹
+  RAIN_RECHECK_FAIL = 'RAIN_RECHECK_FAIL', // 雨后复查不合格
 }
 
 export enum IssueStatus {
@@ -258,6 +261,8 @@ export class ReviewPlan {
   requirement: string; // 整改总体要求
   @Column({ type: 'date' })
   deadline: string; // 整改期限
+  @Column({ type: 'simple-json', nullable: true })
+  deadlineHistory: { from: string; to: string; reason: string; at: string; by: string }[]; // 整改期限历次调整（雨后延期留痕）
   @Column({ default: false })
   stopUseRequired: boolean; // 必须暂停使用
   @Column({ default: false })
@@ -331,6 +336,8 @@ export class EvacuationRecord {
   returnedAt: Date; // 安全整改后返回时间
   @Column({ default: false })
   allowReturn: boolean; // 是否准许返回（验收通过前不得返回）
+  @Column({ nullable: true })
+  rainEventId: string; // 雨后风险事件触发的人员转移
   @Column()
   recorderId: string;
   @Column({ type: 'text', nullable: true })
@@ -389,6 +396,8 @@ export class IssueRecord {
   status: IssueStatus;
   @Column({ type: 'boolean', default: false })
   blocksWorkflow: boolean; // 是否阻断当前环节
+  @Column({ nullable: true })
+  rainEventId: string; // 雨后风险事件自动开单时回链
   @Column()
   raisedById: string;
   @Column({ nullable: true })
@@ -496,14 +505,20 @@ export class BudgetItem {
 export class SubsidyApplication {
   @PrimaryGeneratedColumn('uuid')
   id: string;
-  @Column({ unique: true })
-  houseId: string;
+  @Column()
+  houseId: string; // 一栋房屋可同时存在「修缮补助」与「临时安置救助」两条申请（按 aidKind 区分）
   @Column({ nullable: true })
   planId: string;
   @Column({ type: 'numeric', precision: 12, scale: 2, default: 0 })
   amount: string;
   @Column({ type: 'varchar', length: 24, default: DifficultyType.NONE })
   difficultyType: DifficultyType;
+  @Column({ type: 'varchar', length: 24, default: 'RECTIFY' })
+  aidKind: string; // RECTIFY=修缮补助 / EMERGENCY=临时安置救助（困难家庭雨后双通道）
+  @Column({ nullable: true })
+  rainEventId: string; // 关联雨后风险事件（应急通道）
+  @Column({ nullable: true })
+  taskId: string; // 关联处置任务（应急通道）
   @Column({ type: 'varchar', length: 16, default: SubsidyStatus.DRAFT })
   status: SubsidyStatus;
   @Column({ type: 'simple-json', nullable: true })
@@ -643,7 +658,7 @@ export class HouseActivity {
   @Column()
   houseId: string;
   @Column({ type: 'varchar', length: 32 })
-  kind: string; // INSPECTION/REVIEW/NOTICE/EVACUATE/PLAN/SUBSIDY/MATERIAL/CONSTRUCTION/ACCEPTANCE/CLOSE/RECHECK/ISSUE/CONSULT
+  kind: string; // INSPECTION/REVIEW/NOTICE/EVACUATE/PLAN/SUBSIDY/MATERIAL/CONSTRUCTION/ACCEPTANCE/CLOSE/RECHECK/ISSUE/CONSULT/RAIN_EVENT
   @Column()
   title: string;
   @Column({ type: 'text', nullable: true })
@@ -654,4 +669,162 @@ export class HouseActivity {
   operatorName: string;
   @CreateDateColumn()
   createdAt: Date;
+}
+
+// ---------- 暴雨后复核上报与持续升级风险事件 ----------
+export enum RainEventStatus {
+  OPEN = 'OPEN', // 待乡镇处置决定
+  DISPOSING = 'DISPOSING', // 已决定处置（继续/延期/转移），待雨后复查
+  RESTORED = 'RESTORED', // 复查合格，恢复正常等级
+}
+
+export enum RainDisposition {
+  CONTINUE = 'CONTINUE', // 维持措施，继续按原计划整改
+  EXTEND = 'EXTEND', // 风险加重但可管控，延长整改期限
+  EVACUATE = 'EVACUATE', // 先安排人员转移
+}
+
+export enum RainTaskType {
+  CADRE_URGENT = 'CADRE_URGENT', // 村干部：紧急转移与现场管控
+  TOWNSHIP_DISPOSE = 'TOWNSHIP_DISPOSE', // 住建：停用、延期/调整方案、工程整改
+  CIVIL_AFFAIRS = 'CIVIL_AFFAIRS', // 民政：困难家庭临时安置救助与修缮补助
+}
+
+export enum RainTaskStatus {
+  PENDING = 'PENDING',
+  DONE = 'DONE',
+}
+
+/** 同栋房屋三天（72h）内反复上报 → 一条持续升级的风险事件 */
+@Entity('rain_events')
+export class RainEvent {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+  @Column()
+  houseId: string;
+  @Column({ type: 'varchar', length: 16 })
+  riskLevel: RiskLevel; // 事件期内达到的最高风险等级（持续升级）
+  @Column({ type: 'int', default: 1 })
+  stage: number; // 升级档位：1 初次上报 2 重复上报升级 3 再次上报/转移级
+  @Column({ type: 'int', default: 0 })
+  reportCount: number;
+  @Column({ type: 'varchar', length: 16, default: RainEventStatus.OPEN })
+  status: RainEventStatus;
+  @Column({ type: 'simple-json' })
+  reasons: string[]; // 最新判定依据（接回原风险档案）
+  @Column({ type: 'boolean', default: false })
+  difficultFamily: boolean; // 事件涉及困难家庭
+  @Column({ type: 'varchar', length: 16, nullable: true })
+  disposition: RainDisposition; // 乡镇处置决定
+  @Column({ type: 'text', nullable: true })
+  dispositionNote: string;
+  @Column({ nullable: true })
+  decidedById: string;
+  @Column({ nullable: true })
+  decidedByName: string;
+  @Column({ type: 'timestamptz', nullable: true })
+  decidedAt: Date;
+  @Column({ type: 'date', nullable: true })
+  extendedDeadline: string; // 延长后的整改期限
+  @Column({ type: 'varchar', length: 16, nullable: true })
+  previousRiskLevel: RiskLevel; // 事件开始前的原风险等级（复查合格后恢复）
+  @Column({ type: 'varchar', length: 32, nullable: true })
+  previousHouseStatus: HouseStatus; // 事件开始前的原治理状态（复查合格后恢复，不借新告警重置整改流程）
+  @Column({ nullable: true })
+  previousPlanId: string; // 事件开始前的原整改方案
+  @Column({ type: 'text', nullable: true })
+  restoreNote: string;
+  @Column({ type: 'timestamptz', nullable: true })
+  restoredAt: Date;
+  @CreateDateColumn()
+  createdAt: Date;
+  @Column({ type: 'timestamptz' })
+  lastReportAt: Date;
+}
+
+/** 暴雨后现场上报（多条上报聚合进同一事件） */
+@Entity('rain_reports')
+export class RainReport {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+  @Column()
+  eventId: string;
+  @Column()
+  houseId: string;
+  @Column()
+  reporterId: string;
+  @Column({ nullable: true })
+  reporterName: string;
+  @Column({ type: 'timestamptz' })
+  reportedAt: Date;
+  @Column({ type: 'int' })
+  wallCrack: number;
+  @Column({ type: 'int' })
+  roofLeak: number;
+  @Column({ type: 'int' })
+  foundationSettlement: number;
+  @Column({ type: 'int', default: 0 })
+  residents: number;
+  @Column({ default: true })
+  rainSeason: boolean;
+  @Column({ type: 'varchar', length: 16 })
+  riskLevel: RiskLevel;
+  @Column({ type: 'simple-json' })
+  reasons: string[];
+  @Column({ type: 'int', default: 1 })
+  stage: number; // 第几次上报（1/2/3…）
+  @Column({ type: 'simple-json', nullable: true })
+  photos: string[];
+  @Column({ type: 'text', nullable: true })
+  notes: string;
+}
+
+/** 转移级事件的同一处置任务：村干部、住建、民政收到同一条任务 */
+@Entity('rain_disposition_tasks')
+export class DispositionTask {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+  @Column()
+  eventId: string;
+  @Column()
+  houseId: string;
+  @Column({ type: 'varchar', length: 32 })
+  taskType: RainTaskType;
+  @Column({ type: 'text' })
+  title: string;
+  @Column({ type: 'text', nullable: true })
+  requirement: string;
+  @Column({ type: 'varchar', length: 16, default: RainTaskStatus.PENDING })
+  status: RainTaskStatus;
+  @Column({ type: 'timestamptz' })
+  createdAt: Date;
+  @Column({ type: 'timestamptz', nullable: true })
+  doneAt: Date;
+  @Column({ type: 'text', nullable: true })
+  result: string;
+  @OneToMany(() => DispositionAssignee, (a) => a.task, { cascade: true })
+  assignees: DispositionAssignee[];
+}
+
+@Entity('rain_task_assignees')
+export class DispositionAssignee {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+  @ManyToOne(() => DispositionTask, (t) => t.assignees, { onDelete: 'CASCADE' })
+  @JoinColumn({ name: 'taskId' })
+  task: DispositionTask;
+  @Column()
+  taskId: string;
+  @Column({ type: 'varchar', length: 32 })
+  role: RainTaskType; // 村干部 / 住建 / 民政
+  @Column({ nullable: true })
+  userId: string; // 落实到具体账号（可待领取）
+  @Column({ nullable: true })
+  userName: string;
+  @Column({ type: 'varchar', length: 16, default: RainTaskStatus.PENDING })
+  status: RainTaskStatus;
+  @Column({ type: 'timestamptz', nullable: true })
+  doneAt: Date;
+  @Column({ type: 'text', nullable: true })
+  result: string;
 }

@@ -1,6 +1,6 @@
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, In, Repository } from 'typeorm';
+import { DataSource, EntityManager, In, Repository } from 'typeorm';
 import {
   Acceptance,
   AcceptanceItemResult,
@@ -12,6 +12,8 @@ import {
   ConstructionTeam,
   Consultation,
   DifficultyType,
+  DispositionAssignee,
+  DispositionTask,
   EvacuationRecord,
   FamilyProfile,
   House,
@@ -23,6 +25,12 @@ import {
   IssueType,
   ItemStatus,
   NoticeRecord,
+  RainDisposition,
+  RainEvent,
+  RainEventStatus,
+  RainReport,
+  RainTaskStatus,
+  RainTaskType,
   RectificationItem,
   RecheckRecord,
   ReviewPlan,
@@ -31,11 +39,16 @@ import {
   SubsidyApplication,
   SubsidyStatus,
   User,
+  UserRole,
 } from './entities';
 import { evaluateRisk } from './risk.rules';
+import { RAIN_MERGE_WINDOW_MS, maxLevel, mergeRainReport, rankLevel, scoreRainCandidate } from './rain.rules';
 
 const SUBSIDY_RATE = 0.7; // 补助不超过核定预算的70%
-const SUBSIDY_CAP = 50000; // 每户最高补助5万元
+const SUBSIDY_CAP = 50000; // 每户最高修缮补助5万元
+const EMERGENCY_AID_CAP = 10000; // 临时安置应急救助上限
+const AID_KIND_RECTIFY = 'RECTIFY'; // 修缮补助
+const AID_KIND_EMERGENCY = 'EMERGENCY'; // 临时安置救助
 
 export interface CurrentUser {
   sub: string;
@@ -68,6 +81,10 @@ export class AppService {
     @InjectRepository(AcceptanceItemResult) private results: Repository<AcceptanceItemResult>,
     @InjectRepository(CloseRecord) private closes: Repository<CloseRecord>,
     @InjectRepository(RecheckRecord) private rechecks: Repository<RecheckRecord>,
+    @InjectRepository(RainEvent) private rainEvents: Repository<RainEvent>,
+    @InjectRepository(RainReport) private rainReports: Repository<RainReport>,
+    @InjectRepository(DispositionTask) private rainTasks: Repository<DispositionTask>,
+    @InjectRepository(DispositionAssignee) private rainAssignees: Repository<DispositionAssignee>,
     @InjectRepository(HouseActivity) private activities: Repository<HouseActivity>,
     @InjectRepository(User) private users: Repository<User>,
     private dataSource: DataSource,
@@ -351,6 +368,7 @@ export class AppService {
           photos: body.photos || [],
           settledAt: new Date(body.settledAt || Date.now()),
           allowReturn: false,
+          rainEventId: body.rainEventId || null,
           recorderId: u.sub,
           remark: body.remark || '',
         }),
@@ -617,6 +635,12 @@ export class AppService {
 
   async submitSubsidy(u: CurrentUser, houseId: string, body: any) {
     const house = await this.getHouseOrFail(houseId);
+    const aidKind = body.aidKind === AID_KIND_EMERGENCY ? AID_KIND_EMERGENCY : AID_KIND_RECTIFY;
+
+    if (aidKind === AID_KIND_EMERGENCY) {
+      return this.submitEmergencyAid(u, house, body);
+    }
+
     const guards = await this.computeSubsidyGuards(house);
     const allPass = guards.every((g) => g.ok);
     const cplan = await this.cplans.findOne({ where: { houseId } });
@@ -624,8 +648,8 @@ export class AppService {
     const maxAmount = Math.min(Math.round(budget * SUBSIDY_RATE), SUBSIDY_CAP);
     const amount = Math.min(Number(body.amount || 0), maxAmount);
 
-    let app = await this.subsidies.findOne({ where: { houseId } });
-    if (!app) app = this.subsidies.create({ houseId });
+    let app = await this.subsidies.findOne({ where: { houseId, aidKind: AID_KIND_RECTIFY } });
+    if (!app) app = this.subsidies.create({ houseId, aidKind: AID_KIND_RECTIFY });
     app.amount = amount.toFixed(2);
     app.difficultyType = body.difficultyType || app.difficultyType || DifficultyType.NONE;
     app.guardResults = guards;
@@ -637,49 +661,159 @@ export class AppService {
     await this.logActivity(
       houseId,
       'SUBSIDY',
-      allPass ? `补助申请已提交（¥${amount.toFixed(2)}，待乡镇复核）` : '补助申请资格校验未通过，退回补充',
+      allPass ? `修缮补助申请已提交（¥${amount.toFixed(2)}，待乡镇复核）` : '修缮补助资格校验未通过，退回补充',
       guards.filter((g) => !g.ok).map((g) => `${g.label}：${g.message}`).join('；') || '全部校验通过',
       u,
     );
     return { application: app, allPass, maxAmount };
   }
 
+  /** 临时安置应急救助（民政通道）：困难家庭 + 已触发转移级雨后事件（或方案要求转移且已安置） */
+  private async submitEmergencyAid(u: CurrentUser, house: House, body: any) {
+    const fam = await this.families.findOne({ where: { houseId: house.id } });
+    const evacEvent = await this.rainEvents.findOne({
+      where: { houseId: house.id, disposition: RainDisposition.EVACUATE },
+      order: { lastReportAt: 'DESC' },
+    });
+    const plan = await this.latestPlan(house.id);
+    const evacuated = !!(await this.evacuations.findOne({ where: { houseId: house.id } }));
+    const eligibleEvent = !!(evacEvent || (plan?.evacuationRequired && evacuated));
+
+    const guards = [
+      {
+        label: '困难家庭认定',
+        ok: !!fam && fam.difficultyType !== DifficultyType.NONE,
+        message: !fam ? '未登记家庭情况' : fam.difficultyType === DifficultyType.NONE ? '非困难家庭，临时安置救助须符合民政救助条件' : `已认定：${difficultyLabel(fam.difficultyType)}`,
+      },
+      {
+        label: '困难证明材料',
+        ok: !!fam && (fam.difficultyProof?.length || 0) > 0,
+        message: fam?.difficultyProof?.length ? `已上传 ${fam.difficultyProof.length} 份` : '缺少民政部门困难证明',
+      },
+      {
+        label: '人员转移已落实',
+        ok: eligibleEvent,
+        message: evacEvent ? '雨后事件已决定先转移人员，安置任务由民政/村干部落实' : plan?.evacuationRequired ? (evacuated ? '人员已转移安置' : '应紧急转移但尚未安置') : '未达到转移级险情，不适用临时安置救助',
+      },
+    ].map((g) => ({ ...g, passed: g.ok }));
+    const allPass = guards.every((g) => g.ok);
+    const amount = Math.min(Number(body.amount || 0), EMERGENCY_AID_CAP);
+
+    let app = await this.subsidies.findOne({ where: { houseId: house.id, aidKind: AID_KIND_EMERGENCY } });
+    if (!app) app = this.subsidies.create({ houseId: house.id, aidKind: AID_KIND_EMERGENCY });
+    app.amount = amount.toFixed(2);
+    app.difficultyType = fam?.difficultyType || DifficultyType.NONE;
+    app.guardResults = guards;
+    app.rainEventId = evacEvent?.id || app.rainEventId || null;
+    app.planId = plan?.id || app.planId || null;
+    app.status = allPass ? SubsidyStatus.SUBMITTED : SubsidyStatus.DRAFT;
+    app.reviewComment = allPass ? null : '临时安置救助资格校验未全部通过，退回补充';
+    if (evacEvent) {
+      app.rainEventId = evacEvent.id;
+      const civilTask = await this.rainTasks.findOne({ where: { eventId: evacEvent.id, taskType: RainTaskType.CIVIL_AFFAIRS } });
+      if (civilTask) app.taskId = civilTask.id;
+    }
+    app = await this.subsidies.save(app);
+
+    await this.logActivity(
+      house.id,
+      'SUBSIDY',
+      allPass ? `临时安置救助申请已提交（¥${amount.toFixed(2)}，待民政复核）` : '临时安置救助资格校验未通过',
+      guards.filter((g) => !g.ok).map((g) => `${g.label}：${g.message}`).join('；') || '全部校验通过',
+      u,
+    );
+    return { application: app, allPass, maxAmount: EMERGENCY_AID_CAP };
+  }
+
   async reviewSubsidy(u: CurrentUser, id: string, body: any) {
     const app = await this.subsidies.findOne({ where: { id } });
     if (!app) throw new NotFoundException();
+    // 临时安置救助由民政审批；修缮补助由乡镇住建审批（角色闸先于状态闸）
+    if (app.aidKind === AID_KIND_EMERGENCY && u.role !== UserRole.CIVIL_AFFAIRS && u.role !== UserRole.COUNTY_ADMIN) {
+      throw new ForbiddenException('临时安置救助由民政部门复核审批');
+    }
+    if (app.aidKind === AID_KIND_RECTIFY && u.role === UserRole.CIVIL_AFFAIRS) {
+      throw new ForbiddenException('修缮补助由乡镇住建复核审批');
+    }
     if (app.status !== SubsidyStatus.SUBMITTED) throw new BadRequestException('仅待复核的申请可审批');
-    const disputes = await this.issues.find({
-      where: { houseId: app.houseId, type: IssueType.SUBSIDY_DISPUTE, status: In([IssueStatus.OPEN, IssueStatus.RESOLVING]) },
-    });
-    if (disputes.length && body.approved) {
-      throw new BadRequestException('该户存在未办结的补助资格争议，不得批准补助');
+    if (app.aidKind === AID_KIND_RECTIFY) {
+      const disputes = await this.issues.find({
+        where: { houseId: app.houseId, type: IssueType.SUBSIDY_DISPUTE, status: In([IssueStatus.OPEN, IssueStatus.RESOLVING]) },
+      });
+      if (disputes.length && body.approved) {
+        throw new BadRequestException('该户存在未办结的补助资格争议，不得批准补助');
+      }
     }
     app.status = body.approved ? SubsidyStatus.APPROVED : SubsidyStatus.REJECTED;
-    app.reviewComment = body.comment || (body.approved ? '资格符合，同意补助' : '复核不通过');
+    app.reviewComment = body.comment || (body.approved ? (app.aidKind === AID_KIND_EMERGENCY ? '符合临时救助条件，同意救助' : '资格符合，同意补助') : '复核不通过');
     app.reviewedById = u.sub;
     app.reviewedAt = new Date();
     await this.subsidies.save(app);
-    await this.logActivity(app.houseId, 'SUBSIDY', body.approved ? `补助申请已批准 ¥${app.amount}（验收销号后发放）` : '补助申请被驳回', app.reviewComment, u);
+    await this.logActivity(
+      app.houseId,
+      'SUBSIDY',
+      app.aidKind === AID_KIND_EMERGENCY
+        ? (body.approved ? `临时安置救助已批准 ¥${app.amount}（安置落实后发放）` : '临时安置救助被驳回')
+        : (body.approved ? `修缮补助已批准 ¥${app.amount}（复查合格销号后发放）` : '修缮补助被驳回'),
+      app.reviewComment,
+      u,
+    );
     return app;
   }
 
-  async getSubsidyByHouse(houseId: string) {
-    const app = await this.subsidies.findOne({ where: { houseId } });
-    if (!app) throw new NotFoundException('该房屋暂无补助申请');
+  async getSubsidyByHouse(houseId: string, aidKind = AID_KIND_RECTIFY) {
+    const app = await this.subsidies.findOne({ where: { houseId, aidKind } });
+    if (!app) throw new NotFoundException(aidKind === AID_KIND_EMERGENCY ? '该房屋暂无临时安置救助申请' : '该房屋暂无补助申请');
     return app;
   }
 
-  /** 发放：必须在验收通过（销号）后，且申请已批准 */
+  /**
+   * 发放闸：
+   *  - 修缮补助：必须复查合格、完成销号后发放（防止“带病拨款”）；
+   *  - 临时安置救助：民政安置任务已落实（任务办结填写结果）后即可发放，无需等待工程销号。
+   */
   async paySubsidy(u: CurrentUser, id: string) {
     const app = await this.subsidies.findOne({ where: { id } });
     if (!app) throw new NotFoundException();
     if (app.status !== SubsidyStatus.APPROVED) throw new BadRequestException('仅已批准的申请可发放');
+    if (app.aidKind === AID_KIND_EMERGENCY) {
+      if (u.role !== UserRole.CIVIL_AFFAIRS && u.role !== UserRole.COUNTY_ADMIN) {
+        throw new ForbiddenException('临时安置救助由民政部门发放');
+      }
+      // 本户本事件的民政安置任务须已办结（填写安置结果）
+      let placementDone = false;
+      if (app.taskId) {
+        placementDone = !!(await this.rainAssignees.findOne({
+          where: { taskId: app.taskId, role: RainTaskType.CIVIL_AFFAIRS, status: RainTaskStatus.DONE },
+        }));
+      }
+      if (!placementDone && app.rainEventId) {
+        const civilTask = await this.rainTasks.findOne({ where: { eventId: app.rainEventId, taskType: RainTaskType.CIVIL_AFFAIRS } });
+        if (civilTask) {
+          placementDone = !!(await this.rainAssignees.findOne({
+            where: { taskId: civilTask.id, status: RainTaskStatus.DONE },
+          }));
+        }
+      }
+      // 存量方案转移场景（无事件任务）以转移记录兜底
+      const evac = app.rainEventId
+        ? await this.evacuations.findOne({ where: { rainEventId: app.rainEventId } })
+        : await this.evacuations.findOne({ where: { houseId: app.houseId }, order: { settledAt: 'DESC' } });
+      if (!placementDone && !evac) {
+        throw new BadRequestException('人员临时安置尚未落实（民政安置任务未办结且无转移记录），救助金不得发放');
+      }
+      app.status = SubsidyStatus.PAID;
+      app.paidAt = new Date();
+      await this.subsidies.save(app);
+      await this.logActivity(app.houseId, 'SUBSIDY', `临时安置救助金已发放 ¥${app.amount}`, '民政应急通道，与修缮补助并行', u);
+      return app;
+    }
     const close = await this.closes.findOne({ where: { houseId: app.houseId } });
-    if (!close) throw new BadRequestException('房屋未完成验收销号，补助不得提前发放（防止“带病拨款”）');
+    if (!close) throw new BadRequestException('房屋未复查合格并销号，修缮补助不得提前发放（防止“带病拨款”）');
     app.status = SubsidyStatus.PAID;
     app.paidAt = new Date();
     await this.subsidies.save(app);
-    await this.logActivity(app.houseId, 'SUBSIDY', `补助资金已发放 ¥${app.amount}`, '验收销号后发放，符合条件家庭', u);
+    await this.logActivity(app.houseId, 'SUBSIDY', `修缮补助资金已发放 ¥${app.amount}`, '复查合格销号后发放，符合条件家庭', u);
     return app;
   }
 
@@ -775,6 +909,10 @@ export class AppService {
     const plan = await this.latestPlan(house.id);
     if (!plan) throw new BadRequestException('没有整改方案');
     if (house.status === HouseStatus.CLOSED) throw new BadRequestException('房屋已销号');
+    const openRainForAcceptance = await this.rainEvents.findOne({ where: { houseId: house.id, status: In([RainEventStatus.OPEN, RainEventStatus.DISPOSING]) } });
+    if (openRainForAcceptance) {
+      throw new BadRequestException(`存在未复查合格的雨后风险事件（${openRainForAcceptance.stage}档上报），雨后复查合格前不得组织验收销号`);
+    }
     await this.assertNoBlocking(house.id, '组织验收');
 
     const itemResults: any[] = body.itemResults || [];
@@ -870,6 +1008,11 @@ export class AppService {
   // ---------- 销号 ----------
   async closeHouse(u: CurrentUser, body: any) {
     const house = await this.getHouseOrFail(body.houseId);
+    // 雨后事件未复查合格，直接阻断销号（先于验收记录检查，避免被其他前置错误掩盖）
+    const openRain = await this.rainEvents.findOne({ where: { houseId: house.id, status: In([RainEventStatus.OPEN, RainEventStatus.DISPOSING]) } });
+    if (openRain) {
+      throw new BadRequestException(`存在未复查合格的雨后风险事件（${openRain.stage}档上报，${openRain.disposition ? rainDispositionLabel(openRain.disposition) : '待处置决定'}），复查合格前不得销号`);
+    }
     const acc = await this.acceptances.findOne({ where: { houseId: house.id }, order: { acceptedAt: 'DESC' }, relations: ['itemResults'] });
     if (!acc || acc.overall !== AcceptanceResult.PASS) throw new BadRequestException('最新验收未通过，不能销号');
     if (house.status !== HouseStatus.PENDING_ACCEPTANCE) {
@@ -962,6 +1105,552 @@ export class AppService {
     });
   }
 
+  // ---------- 暴雨后复核：候选筛查 ----------
+  /**
+   * 从历史裂缝、上次复查结论、整改期限、家庭困难四维筛查真正需要重新上门的房屋。
+   * 已纳入开放雨后事件的房屋始终置顶返回（即便房屋已不在整改期状态）。
+   */
+  async rainCandidates(query: any, u: CurrentUser) {
+    const forcedTownship = [UserRole.TOWNSHIP_REVIEWER, UserRole.GRID_WORKER, UserRole.CADRE].includes(u.role as UserRole) ? u.township : null;
+    const township = query.township || forcedTownship;
+    const where: any = {};
+    if (township) where.township = township;
+    const houses = await this.houses.find({ where });
+
+    const openEvents = await this.rainEvents.find({
+      where: { status: In([RainEventStatus.OPEN, RainEventStatus.DISPOSING]) },
+      order: { lastReportAt: 'DESC' },
+    });
+    const eventMap = new Map(openEvents.map((e) => [e.houseId, e]));
+
+    const rows = [] as any[];
+    for (const house of houses) {
+      const plan = await this.latestPlan(house.id);
+      const family = await this.families.findOne({ where: { houseId: house.id } });
+      const lastRecheck = await this.rechecks.findOne({ where: { houseId: house.id }, order: { checkedAt: 'DESC' } });
+      const c = scoreRainCandidate(house, plan, family, { lastRecheckResult: lastRecheck?.result });
+      const ev = eventMap.get(house.id);
+      // 正在整改期（方案已出且未销号），或已有开放事件；已销号房屋不再上门筛查
+      const inRectification =
+        !!plan && house.status !== HouseStatus.CLOSED;
+      if (house.status === HouseStatus.CLOSED && !ev) continue;
+      if (!c.needsVisit && !ev) continue;
+      rows.push({
+        house: {
+          id: house.id, code: house.code, township: house.township, village: house.village,
+          ownerName: house.ownerName, address: house.address, riskLevel: house.riskLevel,
+          status: house.status, wallCrack: house.wallCrack, roofLeak: house.roofLeak,
+          foundationSettlement: house.foundationSettlement, residents: house.residents,
+          difficult: !!family && family.difficultyType !== DifficultyType.NONE,
+          difficultyType: family?.difficultyType || DifficultyType.NONE,
+        },
+        score: c.score,
+        reasons: c.reasons,
+        overdue: c.overdue,
+        deadlineSoon: c.deadlineSoon,
+        deadline: plan?.deadline || null,
+        inRectification,
+        event: ev ? this.summarizeEvent(ev) : null,
+      });
+    }
+    // 开放事件优先，其次按筛查分值、风险等级排序
+    const riskOrder: Record<string, number> = { EVACUATE: 3, SUSPEND: 2, RECTIFY: 1, NORMAL: 0 };
+    rows.sort((a, b) => {
+      if (!!a.event !== !!b.event) return a.event ? -1 : 1;
+      if (b.score !== a.score) return b.score - a.score;
+      return (riskOrder[b.house.riskLevel] || 0) - (riskOrder[a.house.riskLevel] || 0);
+    });
+    return { total: rows.length, data: rows };
+  }
+
+  private summarizeEvent(e: RainEvent) {
+    return {
+      id: e.id, status: e.status, riskLevel: e.riskLevel, stage: e.stage, reportCount: e.reportCount,
+      disposition: e.disposition, reasons: e.reasons, difficultFamily: e.difficultFamily,
+      lastReportAt: e.lastReportAt, extendedDeadline: e.extendedDeadline,
+      previousRiskLevel: e.previousRiskLevel,
+    };
+  }
+
+  // ---------- 暴雨后现场上报：72h 聚合为一条持续升级事件 ----------
+  async createRainReport(u: CurrentUser, body: any) {
+    const house = await this.getHouseOrFail(body.houseId);
+    const measure = {
+      wallCrack: Number(body.wallCrack || 0),
+      roofLeak: Number(body.roofLeak || 0),
+      foundationSettlement: Number(body.foundationSettlement || 0),
+      residents: Number(body.residents ?? house.residents ?? 0),
+    };
+    const { level, reasons } = evaluateRisk({
+      buildYear: house.buildYear,
+      floors: house.floors,
+      isBusiness: house.isBusiness,
+      isRented: house.isRented,
+      isAddedFloor: house.isAddedFloor,
+      wallCrack: measure.wallCrack,
+      roofLeak: measure.roofLeak,
+      foundationSettlement: measure.foundationSettlement,
+      residents: measure.residents,
+      rainSeason: true,
+    });
+    const now = body.reportedAt ? new Date(body.reportedAt) : new Date();
+    const family = await this.families.findOne({ where: { houseId: house.id } });
+
+    return this.dataSource.transaction(async (m) => {
+      // 找 72h 内最近一条开放/处置中的事件
+      const events = await m.find(RainEvent, {
+        where: { houseId: house.id },
+        order: { lastReportAt: 'DESC' },
+        take: 1,
+      });
+      let event = events[0];
+      const withinWindow = event && now.getTime() - new Date(event.lastReportAt).getTime() <= RAIN_MERGE_WINDOW_MS
+        && event.status !== RainEventStatus.RESTORED;
+      let isNew = false;
+      let escalated = false;
+      if (!event || !withinWindow) {
+        isNew = true;
+        const prevPlan = await m.findOne(ReviewPlan, { where: { houseId: house.id }, order: { reviewedAt: 'DESC' } });
+        event = m.create(RainEvent, {
+          houseId: house.id,
+          riskLevel: level,
+          stage: 1,
+          reportCount: 0,
+          status: RainEventStatus.OPEN,
+          reasons,
+          difficultFamily: !!family && family.difficultyType !== DifficultyType.NONE,
+          previousRiskLevel: house.riskLevel,
+          previousHouseStatus: house.status,
+          previousPlanId: prevPlan?.id || null,
+          lastReportAt: now,
+        });
+      } else {
+        const prevReports = await m.find(RainReport, { where: { eventId: event.id }, order: { reportedAt: 'DESC' }, take: 1 });
+        const merged = mergeRainReport({
+          prevStage: event.stage,
+          prevLevel: event.riskLevel,
+          prevMeasure: prevReports[0]
+            ? {
+                wallCrack: prevReports[0].wallCrack, roofLeak: prevReports[0].roofLeak,
+                foundationSettlement: prevReports[0].foundationSettlement, residents: prevReports[0].residents,
+              }
+            : null,
+          evaluatedLevel: level,
+          measure,
+        });
+        event.stage = merged.stage;
+        event.riskLevel = merged.level;
+        event.reasons = reasons;
+        escalated = merged.escalated;
+        if (family && family.difficultyType !== DifficultyType.NONE) event.difficultFamily = true;
+        event.lastReportAt = now;
+      }
+      event.reportCount += 1;
+      event = await m.save(event);
+
+      const report = await m.save(
+        m.create(RainReport, {
+          eventId: event.id,
+          houseId: house.id,
+          reporterId: u.sub,
+          reporterName: u.name,
+          reportedAt: now,
+          wallCrack: measure.wallCrack,
+          roofLeak: measure.roofLeak,
+          foundationSettlement: measure.foundationSettlement,
+          residents: measure.residents,
+          rainSeason: true,
+          riskLevel: level,
+          reasons,
+          stage: event.stage,
+          photos: body.photos || [],
+          notes: body.notes || null,
+        }),
+      );
+
+      // 接回原风险档案：回写最新实测隐患与事件期最高风险等级（不改变治理流程状态）
+      house.wallCrack = measure.wallCrack;
+      house.roofLeak = measure.roofLeak;
+      house.foundationSettlement = measure.foundationSettlement;
+      if (measure.residents > 0) house.residents = measure.residents;
+      house.ruleReasons = reasons;
+      if (rankLevel(event.riskLevel) > rankLevel(house.riskLevel)) house.riskLevel = event.riskLevel;
+      await m.save(house);
+
+      await m.save(
+        m.create(HouseActivity, {
+          houseId: house.id,
+          kind: 'RAIN_EVENT',
+          title: isNew
+            ? `暴雨后复核上报 · ${riskLabel(level)}（风险事件建档）`
+            : `暴雨后第 ${event.stage} 次上报并入同一事件${escalated ? `，风险升级为${riskLabel(event.riskLevel)}` : `（${riskLabel(event.riskLevel)}）`}`,
+          detail: `裂缝${measure.wallCrack}/渗漏${measure.roofLeak}/沉降${measure.foundationSettlement}；${reasons.join('；')}${body.notes ? `；${body.notes}` : ''}`,
+          operatorId: u.sub,
+          operatorName: u.name,
+        }),
+      );
+
+      // 升级到转移级：自动挂“雨季风险加重”非阻断提示（事件本身承载处置，不冻结既有整改进度）
+      if (event.riskLevel === RiskLevel.EVACUATE && escalated) {
+        await m.save(
+          m.create(IssueRecord, {
+            houseId: house.id,
+            rainEventId: event.id,
+            type: IssueType.RAIN_SEASON,
+            description: `连续暴雨后险情反复上报并升级至紧急转移级（事件 ${event.stage} 档），需乡镇立即作出处置决定`,
+            status: IssueStatus.OPEN,
+            blocksWorkflow: false,
+            raisedById: u.sub,
+            raisedByName: u.name,
+            raisedAt: now,
+          }),
+        );
+      }
+      return { event: this.summarizeEvent(event), report, merged: !isNew, escalated };
+    });
+  }
+
+  // ---------- 乡镇处置决定：继续原计划 / 延长整改 / 先转移 ----------
+  async decideRainEvent(u: CurrentUser, body: any) {
+    const event = await this.rainEvents.findOne({ where: { id: body.eventId } });
+    if (!event) throw new NotFoundException('雨后风险事件不存在');
+    if (event.status === RainEventStatus.RESTORED) throw new BadRequestException('事件已复查合格关闭，不能再作处置决定');
+    const decision: RainDisposition = body.decision;
+    if (![RainDisposition.CONTINUE, RainDisposition.EXTEND, RainDisposition.EVACUATE].includes(decision)) {
+      throw new BadRequestException('处置决定必须是：继续原计划 / 延长整改 / 先安排人员转移');
+    }
+    if (decision === RainDisposition.EXTEND && !body.newDeadline) {
+      throw new BadRequestException('延长整改必须给出新的整改期限');
+    }
+    const house = await this.getHouseOrFail(event.houseId);
+
+    return this.dataSource.transaction(async (m) => {
+      event.disposition = decision;
+      event.dispositionNote = body.note || null;
+      event.decidedById = u.sub;
+      event.decidedByName = u.name;
+      event.decidedAt = new Date();
+      event.status = RainEventStatus.DISPOSING;
+
+      const plan = await m.findOne(ReviewPlan, { where: { id: event.previousPlanId || '' }, relations: ['items'] })
+        || await m.findOne(ReviewPlan, { where: { houseId: house.id }, order: { reviewedAt: 'DESC' }, relations: ['items'] });
+
+      if (decision === RainDisposition.CONTINUE) {
+        // 继续原计划：只叠加风险等级与监测要求，整改项/期限/状态一律不重置
+        await m.save(
+          m.create(HouseActivity, {
+            houseId: house.id, kind: 'RAIN_EVENT',
+            title: '雨后处置决定：维持措施，继续按原整改计划推进',
+            detail: body.note || '风险可控，原方案、原期限、已完成整改项继续有效，加密雨后监测',
+            operatorId: u.sub, operatorName: u.name,
+          }),
+        );
+      } else if (decision === RainDisposition.EXTEND) {
+        if (!plan) throw new BadRequestException('该房屋没有在办整改方案，无法延长整改期限');
+        const from = plan.deadline;
+        if (new Date(`${body.newDeadline}T23:59:59`).getTime() <= new Date(`${from}T23:59:59`).getTime()) {
+          throw new BadRequestException('新整改期限必须晚于原期限');
+        }
+        plan.deadlineHistory = [
+          ...(plan.deadlineHistory || []),
+          { from, to: body.newDeadline, reason: body.note || '连续暴雨后险情加重，无法按原期限完工', at: new Date().toISOString(), by: u.name },
+        ];
+        plan.deadline = body.newDeadline;
+        event.extendedDeadline = body.newDeadline;
+        await m.save(plan);
+        await m.save(
+          m.create(HouseActivity, {
+            houseId: house.id, kind: 'RAIN_EVENT',
+            title: `雨后处置决定：延长整改期限至 ${body.newDeadline}（原期限 ${from}）`,
+            detail: body.note || '', operatorId: u.sub, operatorName: u.name,
+          }),
+        );
+      } else {
+        // 先安排人员转移：升级风险等级、方案加挂转移要求，但不重置整改状态与整改项
+        event.riskLevel = RiskLevel.EVACUATE;
+        house.riskLevel = maxLevel(house.riskLevel, RiskLevel.EVACUATE);
+        if (plan) {
+          plan.evacuationRequired = true;
+          if (rankLevel(plan.decision) < rankLevel(RiskLevel.SUSPEND)) plan.stopUseRequired = true;
+          await m.save(plan);
+        }
+        await m.save(house);
+        await m.save(
+          m.create(HouseActivity, {
+            houseId: house.id, kind: 'RAIN_EVENT',
+            title: '雨后处置决定：先安排人员转移，村干部/住建/民政收到同一处置任务',
+            detail: body.note || '在原整改计划基础上加挂人员转移与临时管控，转移未落实前不得复工',
+            operatorId: u.sub, operatorName: u.name,
+          }),
+        );
+        await this.createDispositionTasks(m, event, house, u);
+      }
+
+      await m.save(event);
+      return { event: this.summarizeEvent(event) };
+    });
+  }
+
+  /** 转移级处置：村干部、住建、民政收到同一条处置任务（同一 eventId 串联） */
+  private async createDispositionTasks(m: EntityManager, event: RainEvent, house: House, u: CurrentUser) {
+    const cadre = await m.findOne(User, { where: { role: UserRole.CADRE, township: house.township } });
+    const town = await m.findOne(User, { where: { role: UserRole.TOWNSHIP_REVIEWER, township: house.township } });
+    const civil = await m.findOne(User, { where: { role: UserRole.CIVIL_AFFAIRS } });
+    const defs: { type: RainTaskType; title: string; requirement: string; user: User | null }[] = [
+      {
+        type: RainTaskType.CADRE_URGENT,
+        title: `紧急转移管控：${house.code} ${house.ownerName}户`,
+        requirement: '立即组织屋内人员撤离至安全安置点，设置警戒和危房警示，落实临时管控并反馈转移人数',
+        user: cadre,
+      },
+      {
+        type: RainTaskType.TOWNSHIP_DISPOSE,
+        title: `住建处置：${house.code} 雨后停用与工程整改`,
+        requirement: '确认暂停使用/封停，在原整改方案基础上评估加固措施，转移人员复查合格前不得准许返回',
+        user: town,
+      },
+      {
+        type: RainTaskType.CIVIL_AFFAIRS,
+        title: `民政救助：${house.code} ${house.ownerName}户临时安置`,
+        requirement: event.difficultFamily
+          ? '困难家庭：落实临时安置点/生活救助，同步受理临时安置救助与修缮补助申请'
+          : '落实临时安置点与基本生活保障；如经核查符合救助条件，协助申请临时救助',
+        user: civil,
+      },
+    ];
+    const tasks = [];
+    for (const d of defs) {
+      const task = await m.save(
+        m.create(DispositionTask, {
+          eventId: event.id, houseId: house.id, taskType: d.type,
+          title: d.title, requirement: d.requirement, createdAt: new Date(),
+        }),
+      );
+      await m.save(
+        m.create(DispositionAssignee, {
+          taskId: task.id, role: d.type,
+          userId: d.user?.id || null, userName: d.user?.name || null,
+        }),
+      );
+      tasks.push(task);
+    }
+    await m.save(
+      m.create(HouseActivity, {
+        houseId: house.id, kind: 'RAIN_EVENT',
+        title: `同一处置任务已下达三方（村干部 / 住建 / 民政），共 ${tasks.length} 项`,
+        detail: '三方任务按同一风险事件联动；困难家庭可同时申请临时安置救助与修缮补助',
+        operatorId: u.sub, operatorName: u.name,
+      }),
+    );
+  }
+
+  /** 三方任务认领/办结（办结必须填写处置结果） */
+  async completeRainTask(u: CurrentUser, body: any) {
+    const task = await this.rainTasks.findOne({ where: { id: body.taskId }, relations: ['assignees'] });
+    if (!task) throw new NotFoundException('处置任务不存在');
+    if (!body.result) throw new BadRequestException('办结处置任务必须填写处置结果');
+    // 三方任务各归其责：村干部/住建/民政只能办结本部门任务；县级可督办办结任一任务
+    const roleOwned: Record<string, RainTaskType> = {
+      [UserRole.CADRE]: RainTaskType.CADRE_URGENT,
+      [UserRole.CIVIL_AFFAIRS]: RainTaskType.CIVIL_AFFAIRS,
+      [UserRole.TOWNSHIP_REVIEWER]: RainTaskType.TOWNSHIP_DISPOSE,
+    };
+    if (roleOwned[u.role] && roleOwned[u.role] !== task.taskType) {
+      throw new ForbiddenException(`该任务责任方为${rainTaskTypeLabel(task.taskType)}，不能由${rainTaskTypeLabel(roleOwned[u.role])}办结`);
+    }
+    return this.dataSource.transaction(async (m) => {
+      task.status = RainTaskStatus.DONE;
+      task.doneAt = new Date();
+      task.result = body.result;
+      // 把责任方落实到实际办理人（未预分配账号时即“领取并办结”）
+      let assignee = task.assignees.find((a) => a.role === this.roleToTaskType(u.role))
+        || task.assignees[0];
+      if (!assignee) {
+        assignee = await m.save(m.create(DispositionAssignee, {
+          taskId: task.id, role: this.roleToTaskType(u.role), userId: u.sub, userName: u.name,
+        }));
+        task.assignees.push(assignee);
+      }
+      assignee.status = RainTaskStatus.DONE;
+      assignee.doneAt = new Date();
+      assignee.result = body.result;
+      if (!assignee.userId) {
+        assignee.userId = u.sub;
+        assignee.userName = u.name;
+      }
+      await m.save(assignee);
+      await m.save(task);
+
+      const event = await m.findOne(RainEvent, { where: { id: task.eventId } });
+      const house = await m.findOne(House, { where: { id: task.houseId } });
+      await m.save(
+        m.create(HouseActivity, {
+          houseId: task.houseId, kind: 'RAIN_EVENT',
+          title: `处置任务办结（${rainTaskTypeLabel(task.taskType)}）：${task.title}`,
+          detail: body.result, operatorId: u.sub, operatorName: u.name,
+        }),
+      );
+      // 村干部转移任务办结：若已有转移登记则确认管控；民政任务办结不触发工程状态变化
+      void event;
+      void house;
+      return { ok: true, task };
+    });
+  }
+
+  private roleToTaskType(role: string): RainTaskType {
+    if (role === UserRole.CADRE) return RainTaskType.CADRE_URGENT;
+    if (role === UserRole.CIVIL_AFFAIRS) return RainTaskType.CIVIL_AFFAIRS;
+    return RainTaskType.TOWNSHIP_DISPOSE;
+  }
+
+  /** 雨后复查：合格 → 恢复原风险等级/治理状态并允许销号；不合格 → 阻断事件、阻断销号 */
+  async createRainRecheck(u: CurrentUser, body: any) {
+    const event = await this.rainEvents.findOne({ where: { id: body.eventId } });
+    if (!event) throw new NotFoundException('雨后风险事件不存在');
+    if (event.status === RainEventStatus.RESTORED) throw new BadRequestException('该事件已复查合格关闭');
+    if (event.status !== RainEventStatus.DISPOSING) throw new BadRequestException('须先由乡镇作出处置决定后再复查');
+    const house = await this.getHouseOrFail(event.houseId);
+    const pass = body.result === AcceptanceResult.PASS;
+    // 转移级事件复查合格前，人员不得返回（与既有转移记录联动）
+    if (pass && event.disposition === RainDisposition.EVACUATE) {
+      const pendingTasks = await this.rainTasks.count({
+        where: { eventId: event.id, status: RainTaskStatus.PENDING },
+      });
+      if (pendingTasks > 0 && !body.ignoreTasks) {
+        throw new BadRequestException(`仍有 ${pendingTasks} 项村干部/住建/民政处置任务未办结，复查合格前须落实完毕`);
+      }
+    }
+
+    return this.dataSource.transaction(async (m) => {
+      await m.save(
+        m.create(RecheckRecord, {
+          houseId: house.id, result: pass ? AcceptanceResult.PASS : AcceptanceResult.FAIL,
+          reboundNotes: `雨后复查（事件 ${event.stage} 档）：${body.notes || ''}`,
+          wallCrack: body.wallCrack ?? null, roofLeak: body.roofLeak ?? null,
+          foundationSettlement: body.foundationSettlement ?? null,
+          checkedAt: new Date(), inspectorId: u.sub,
+        }),
+      );
+
+      if (!pass) {
+        // 复查不合格：事件保持处置中并开阻断单（阻断验收/销号），必须重新处置后再复查
+        await m.save(
+          m.create(IssueRecord, {
+            houseId: house.id, rainEventId: event.id,
+            type: IssueType.RAIN_RECHECK_FAIL,
+            description: `雨后复查不合格：${body.notes || '险情仍未消除'}`,
+            status: IssueStatus.OPEN, blocksWorkflow: true,
+            raisedById: u.sub, raisedByName: u.name, raisedAt: new Date(),
+          }),
+        );
+        await m.save(
+          m.create(HouseActivity, {
+            houseId: house.id, kind: 'RAIN_EVENT',
+            title: '雨后复查不合格，事件继续处置（验收/销号冻结）',
+            detail: body.notes || '', operatorId: u.sub, operatorName: u.name,
+          }),
+        );
+        return { ok: true, restored: false };
+      }
+
+      // 复查合格：恢复事件前风险等级与治理状态（延长/转移决定带来的措施按复查结论解除）
+      event.status = RainEventStatus.RESTORED;
+      event.restoredAt = new Date();
+      event.restoreNote = body.notes || '雨后复查合格，恢复正常等级';
+      if (event.previousRiskLevel) house.riskLevel = event.previousRiskLevel;
+      if (event.previousHouseStatus) {
+        // 事件期间若房屋本身已沿流程推进（如已到待销号），不回退；仅恢复被事件打断/抬高的状态
+        const advanced = [HouseStatus.PENDING_ACCEPTANCE, HouseStatus.CLOSED].includes(house.status);
+        if (!advanced) house.status = event.previousHouseStatus;
+      }
+      // 解除因事件加挂的停用/转移要求，恢复为复核决定本身对应的措施
+      const plan = event.previousPlanId
+        ? await m.findOne(ReviewPlan, { where: { id: event.previousPlanId } })
+        : null;
+      if (plan) {
+        plan.evacuationRequired = plan.decision === RiskLevel.EVACUATE;
+        plan.stopUseRequired = plan.decision === RiskLevel.SUSPEND || plan.decision === RiskLevel.EVACUATE;
+        await m.save(plan);
+        if (!plan.stopUseRequired) house.stopUseConfirmed = false;
+      } else {
+        house.stopUseConfirmed = false;
+      }
+      await m.save(house);
+      // 准许本次事件转移人员返回
+      await m.update(EvacuationRecord, { rainEventId: event.id, allowReturn: false }, { allowReturn: true, returnedAt: new Date() });
+      // 复查合格：自动办结事件相关全部提示与阻断单（含历次雨后复查不合格单），解除验收/销号冻结
+      await m.update(IssueRecord, { rainEventId: event.id, status: In([IssueStatus.OPEN, IssueStatus.RESOLVING]) }, { status: IssueStatus.RESOLVED, resolvedAt: new Date(), resolution: '雨后复查合格，系统自动办结' });
+      await m.save(event);
+      await m.save(
+        m.create(HouseActivity, {
+          houseId: house.id, kind: 'RAIN_EVENT',
+          title: `雨后复查合格，风险等级恢复为${riskLabel(house.riskLevel)}，事件关闭`,
+          detail: body.notes || '房屋恢复正常等级，可继续验收销号流程',
+          operatorId: u.sub, operatorName: u.name,
+        }),
+      );
+      return { ok: true, restored: true, riskLevel: house.riskLevel, houseStatus: house.status };
+    });
+  }
+
+  // ---------- 雨后事件/任务查询 ----------
+  async listRainEvents(query: any, u: CurrentUser) {
+    const qb = this.rainEvents.createQueryBuilder('e')
+      .leftJoin(House, 'h', 'h.id::text = e."houseId"');
+    if (query.status) qb.andWhere('e.status = :s', { s: query.status });
+    if (query.disposition) qb.andWhere('e.disposition = :d', { d: query.disposition });
+    const township = query.township || ([UserRole.TOWNSHIP_REVIEWER, UserRole.GRID_WORKER, UserRole.CADRE].includes(u.role as UserRole) ? u.township : undefined);
+    if (township) qb.andWhere('h.township = :t', { t: township });
+    qb.orderBy('e."lastReportAt"', 'DESC').limit(300);
+    const events = await qb.getMany();
+    const houseIds = [...new Set(events.map((e) => e.houseId))];
+    const houses = await this.houses.find({ where: { id: In(houseIds) } });
+    const hmap = new Map(houses.map((h) => [h.id, h]));
+    return events.map((e) => ({ ...this.summarizeEvent(e), house: hmap.get(e.houseId) ? {
+      id: e.houseId, code: hmap.get(e.houseId)!.code, township: hmap.get(e.houseId)!.township,
+      village: hmap.get(e.houseId)!.village, ownerName: hmap.get(e.houseId)!.ownerName,
+      status: hmap.get(e.houseId)!.status,
+    } : null }));
+  }
+
+  async rainEventDetail(eventId: string) {
+    const event = await this.rainEvents.findOne({ where: { id: eventId } });
+    if (!event) throw new NotFoundException('雨后风险事件不存在');
+    const [reports, tasks] = await Promise.all([
+      this.rainReports.find({ where: { eventId }, order: { reportedAt: 'ASC' } }),
+      this.rainTasks.find({ where: { eventId }, relations: ['assignees'] }),
+    ]);
+    return { event, reports, tasks };
+  }
+
+  async myRainTasks(u: CurrentUser) {
+    const type = this.roleToTaskType(u.role);
+    const qb = this.rainAssignees.createQueryBuilder('a')
+      .leftJoin(DispositionTask, 't', 't.id = a."taskId"')
+      .leftJoin(House, 'h', 'h.id::text = t."houseId"');
+    // 乡镇住建人员只看本乡镇；县级/民政看全部；村干部按账号乡镇
+    if (u.role === UserRole.TOWNSHIP_REVIEWER || u.role === UserRole.GRID_WORKER || u.role === UserRole.CADRE) {
+      qb.andWhere('h.township = :t', { t: u.township || '' });
+    }
+    if (u.role === UserRole.CADRE) qb.andWhere('a.role = :r', { r: RainTaskType.CADRE_URGENT });
+    if (u.role === UserRole.CIVIL_AFFAIRS) qb.andWhere('a.role = :r', { r: RainTaskType.CIVIL_AFFAIRS });
+    if (u.role === UserRole.TOWNSHIP_REVIEWER) qb.andWhere('a.role = :r', { r: RainTaskType.TOWNSHIP_DISPOSE });
+    void type;
+    qb.orderBy('t."createdAt"', 'DESC').limit(200);
+    const assignees = await qb.getMany();
+    const taskIds = [...new Set(assignees.map((a) => a.taskId))];
+    const tasks = await this.rainTasks.find({ where: { id: In(taskIds) }, relations: ['assignees'] });
+    const houseIds = [...new Set(tasks.map((t) => t.houseId))];
+    const houses = await this.houses.find({ where: { id: In(houseIds) } });
+    const hmap = new Map(houses.map((h) => [h.id, h]));
+    return tasks.map((t) => ({
+      id: t.id, eventId: t.eventId, houseId: t.houseId, taskType: t.taskType,
+      title: t.title, requirement: t.requirement, status: t.status,
+      doneAt: t.doneAt, result: t.result, assignees: t.assignees,
+      house: hmap.get(t.houseId) ? { code: hmap.get(t.houseId)!.code, ownerName: hmap.get(t.houseId)!.ownerName, village: hmap.get(t.houseId)!.village } : null,
+    }));
+  }
+
   // ---------- 房屋档案聚合 ----------
   async listHouses(query: any, u: CurrentUser) {
     const qb = this.houses.createQueryBuilder('h');
@@ -979,7 +1668,8 @@ export class AppService {
     const house = await this.getHouseOrFail(id);
     const [
       inspections, plans, notices, evacuations, stakeholders, consultations, issues,
-      family, cplan, subsidy, logs, acceptances, close, rechecks, activities,
+      family, cplan, subsidyList, logs, acceptances, close, rechecks, activities,
+      rainEvents, rainTasks,
     ] = await Promise.all([
       this.inspections.find({ where: { houseId: id }, order: { inspectedAt: 'DESC' } }),
       this.plans.find({ where: { houseId: id }, order: { reviewedAt: 'DESC' }, relations: ['items'] }),
@@ -990,17 +1680,27 @@ export class AppService {
       this.issues.find({ where: { houseId: id }, order: { raisedAt: 'DESC' } }),
       this.families.findOne({ where: { houseId: id } }),
       this.cplans.findOne({ where: { houseId: id }, relations: ['budgetItems'] }),
-      this.subsidies.findOne({ where: { houseId: id } }),
+      this.subsidies.find({ where: { houseId: id }, order: { createdAt: 'DESC' } }),
       this.logs.find({ where: { houseId: id }, order: { recordedAt: 'DESC' } }),
       this.acceptances.find({ where: { houseId: id }, order: { acceptedAt: 'DESC' }, relations: ['itemResults'] }),
       this.closes.findOne({ where: { houseId: id } }),
       this.rechecks.find({ where: { houseId: id }, order: { checkedAt: 'DESC' } }),
       this.activities.find({ where: { houseId: id }, order: { createdAt: 'DESC' }, take: 200 }),
+      this.rainEvents.find({ where: { houseId: id }, order: { lastReportAt: 'DESC' } }),
+      this.rainTasks.find({ where: { houseId: id }, relations: ['assignees'], order: { createdAt: 'DESC' } }),
     ]);
     const blockingIssues = issues.filter((i) => i.blocksWorkflow && i.status !== IssueStatus.RESOLVED);
+    const subsidy = subsidyList.find((s) => s.aidKind !== AID_KIND_EMERGENCY) || subsidyList[0] || null;
+    const emergencyAid = subsidyList.find((s) => s.aidKind === AID_KIND_EMERGENCY) || null;
+    const rainEventIds = new Set(rainEvents.map((e) => e.id));
+    const rainReports = rainEvents.length
+      ? await this.rainReports.find({ where: { eventId: In([...rainEventIds]) }, order: { reportedAt: 'DESC' } })
+      : [];
     return {
       house, inspections, plans, notices, evacuations, stakeholders, consultations, issues, blockingIssues,
-      family, constructionPlan: cplan, subsidy, constructionLogs: logs, acceptances, close, rechecks, activities,
+      family, constructionPlan: cplan, subsidy, subsidies: subsidyList, emergencyAid,
+      constructionLogs: logs, acceptances, close, rechecks, activities,
+      rainEvents, rainReports, rainTasks,
     };
   }
 
@@ -1060,20 +1760,49 @@ export class AppService {
       else issuesByType[k].open++;
     }
 
-    // 补助
+    // 补助（区分修缮补助与临时安置救助双通道）
     const subQb = this.subsidies.createQueryBuilder('s').leftJoin(House, 'h', 'h.id::text = s."houseId"::text');
     if (township) subQb.andWhere('h.township = :t', { t: township });
     const subsidies = await subQb.getMany();
     const subsidySummary = { draft: 0, submitted: 0, approved: 0, rejected: 0, paid: 0, paidAmount: 0 };
+    const emergencySummary = { draft: 0, submitted: 0, approved: 0, rejected: 0, paid: 0, paidAmount: 0 };
     for (const s of subsidies) {
-      if (s.status === SubsidyStatus.DRAFT) subsidySummary.draft++;
-      if (s.status === SubsidyStatus.SUBMITTED) subsidySummary.submitted++;
-      if (s.status === SubsidyStatus.APPROVED) subsidySummary.approved++;
-      if (s.status === SubsidyStatus.REJECTED) subsidySummary.rejected++;
+      const target = s.aidKind === AID_KIND_EMERGENCY ? emergencySummary : subsidySummary;
+      if (s.status === SubsidyStatus.DRAFT) target.draft++;
+      if (s.status === SubsidyStatus.SUBMITTED) target.submitted++;
+      if (s.status === SubsidyStatus.APPROVED) target.approved++;
+      if (s.status === SubsidyStatus.REJECTED) target.rejected++;
       if (s.status === SubsidyStatus.PAID) {
-        subsidySummary.paid++;
-        subsidySummary.paidAmount += Number(s.amount);
+        target.paid++;
+        target.paidAmount += Number(s.amount);
       }
+    }
+
+    // 暴雨后风险事件与同一处置任务
+    const rainQb = this.rainEvents.createQueryBuilder('e').leftJoin(House, 'h', 'h.id::text = e."houseId"');
+    if (township) rainQb.andWhere('h.township = :t', { t: township });
+    const rainAll = await rainQb.getMany();
+    const rainSummary = { total: rainAll.length, open: 0, disposing: 0, restored: 0, evacuate: 0, difficult: 0, repeated: 0 };
+    for (const e of rainAll) {
+      if (e.status === RainEventStatus.OPEN) rainSummary.open++;
+      if (e.status === RainEventStatus.DISPOSING) rainSummary.disposing++;
+      if (e.status === RainEventStatus.RESTORED) rainSummary.restored++;
+      if (e.disposition === RainDisposition.EVACUATE) rainSummary.evacuate++;
+      if (e.difficultFamily) rainSummary.difficult++;
+      if (e.reportCount > 1) rainSummary.repeated++;
+    }
+    const taskQb = this.rainAssignees.createQueryBuilder('a')
+      .leftJoin(DispositionTask, 't', 't.id = a."taskId"')
+      .leftJoin(House, 'h', 'h.id::text = t."houseId"');
+    if (township) taskQb.andWhere('h.township = :t', { t: township });
+    const allAssignees = await taskQb.getMany();
+    const rainTaskSummary: Record<string, { total: number; done: number }> = {};
+    for (const a of allAssignees) {
+      const k = rainTaskTypeLabel(a.role);
+      rainTaskSummary[a.role] = rainTaskSummary[a.role] || { total: 0, done: 0 };
+      rainTaskSummary[a.role].total++;
+      if (a.status === RainTaskStatus.DONE) rainTaskSummary[a.role].done++;
+      void k;
     }
 
     // 整改项完成情况
@@ -1102,6 +1831,9 @@ export class AppService {
       notStoppedHouses: notStopped.map((h) => ({ id: h.id, code: h.code, township: h.township, village: h.village, ownerName: h.ownerName, riskLevel: h.riskLevel, status: h.status })),
       issuesByType,
       subsidySummary,
+      emergencySummary,
+      rainSummary,
+      rainTaskByRole: Object.entries(rainTaskSummary).map(([role, v]) => ({ role, label: rainTaskTypeLabel(role), ...v })),
       itemByType,
       closureRate: houses.length ? Number((closed / houses.length).toFixed(2)) : 0,
     };
@@ -1132,7 +1864,17 @@ export function issueTypeLabel(t: string) {
   return {
     FARMER_REFUSE: '农户拒绝整改', MATERIAL_SWAP: '偷换材料', SUBSIDY_DISPUTE: '补助资格争议',
     RAIN_SEASON: '雨季风险加重', TENANT_REFUSE: '租户不愿搬离', ACCEPTANCE_FAIL: '验收不通过', REBOUND: '问题反弹',
+    RAIN_RECHECK_FAIL: '雨后复查不合格',
   }[t] || t;
+}
+export function rainDispositionLabel(d: string) {
+  return { CONTINUE: '继续原整改计划', EXTEND: '延长整改期限', EVACUATE: '先安排人员转移' }[d] || d;
+}
+export function rainEventStatusLabel(s: string) {
+  return { OPEN: '待处置决定', DISPOSING: '处置中·待复查', RESTORED: '复查合格已关闭' }[s] || s;
+}
+export function rainTaskTypeLabel(t: string) {
+  return { CADRE_URGENT: '村干部', TOWNSHIP_DISPOSE: '住建', CIVIL_AFFAIRS: '民政' }[t] || t;
 }
 export function difficultyLabel(d: string) {
   return {

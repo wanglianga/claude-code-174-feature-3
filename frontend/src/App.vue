@@ -12,6 +12,7 @@
       <el-menu :default-active="$route.path" router class="menu" background-color="#173a5e" text-color="#c7d6e5" active-text-color="#ffd04b">
         <el-menu-item index="/dashboard"><el-icon><DataAnalysis /></el-icon><span>县级治理驾驶舱</span></el-menu-item>
         <el-menu-item index="/houses"><el-icon><Files /></el-icon><span>房屋档案台账</span></el-menu-item>
+        <el-menu-item v-if="canRain" index="/rain"><el-icon><Umbrella /></el-icon><span>暴雨后复核台</span></el-menu-item>
         <el-menu-item v-if="canInspect" index="/inspect"><el-icon><EditPen /></el-icon><span>巡查登记</span></el-menu-item>
         <el-menu-item v-if="auth.isCounty || auth.isTownship" index="/teams"><el-icon><Tools /></el-icon><span>施工队资质</span></el-menu-item>
       </el-menu>
@@ -45,6 +46,7 @@ const auth = useAuthStore();
 const router = useRouter();
 const roleLabel = computed(() => ROLE_LABELS[auth.user?.role] || '');
 const canInspect = computed(() => ['GRID_WORKER', 'TOWNSHIP_REVIEWER', 'COUNTY_ADMIN'].includes(auth.role));
+const canRain = computed(() => ['GRID_WORKER', 'TOWNSHIP_REVIEWER', 'COUNTY_ADMIN', 'CADRE', 'CIVIL_AFFAIRS', 'ACCEPTOR'].includes(auth.role));
 function onCommand(c) {
   if (c === 'logout') {
     auth.logout();

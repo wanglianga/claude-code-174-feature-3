@@ -43,6 +43,7 @@ export const ISSUE_TYPES = {
   TENANT_REFUSE: '租户不愿搬离',
   ACCEPTANCE_FAIL: '验收不通过',
   REBOUND: '复查发现问题反弹',
+  RAIN_RECHECK_FAIL: '雨后复查不合格',
 };
 
 export const ISSUE_STATUS = {
@@ -90,6 +91,36 @@ export const ROLE_LABELS = {
   FARMER: '农户',
   TEAM: '施工队',
   ACCEPTOR: '验收人员',
+  CADRE: '村干部',
+  CIVIL_AFFAIRS: '民政',
+};
+
+export const RAIN_DISPOSITION = {
+  CONTINUE: { label: '继续原整改计划', type: 'primary' },
+  EXTEND: { label: '延长整改期限', type: 'warning' },
+  EVACUATE: { label: '先安排人员转移', type: 'danger' },
+};
+
+export const RAIN_EVENT_STATUS = {
+  OPEN: { label: '待处置决定', type: 'danger' },
+  DISPOSING: { label: '处置中·待复查', type: 'warning' },
+  RESTORED: { label: '复查合格已关闭', type: 'success' },
+};
+
+export const RAIN_TASK_TYPE = {
+  CADRE_URGENT: { label: '村干部', type: 'warning' },
+  TOWNSHIP_DISPOSE: { label: '住建', type: 'primary' },
+  CIVIL_AFFAIRS: { label: '民政', type: 'success' },
+};
+
+export const RAIN_TASK_STATUS = {
+  PENDING: { label: '待落实', type: 'warning' },
+  DONE: { label: '已办结', type: 'success' },
+};
+
+export const AID_KIND = {
+  RECTIFY: { label: '修缮补助', type: 'primary' },
+  EMERGENCY: { label: '临时安置救助', type: 'warning' },
 };
 
 export const ACTIVITY_KIND = {

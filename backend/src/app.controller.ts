@@ -24,6 +24,8 @@ const ALL_STAFF = [
   UserRole.FARMER,
   UserRole.TEAM,
   UserRole.ACCEPTOR,
+  UserRole.CADRE,
+  UserRole.CIVIL_AFFAIRS,
 ];
 
 @Controller('api')
@@ -145,19 +147,19 @@ export class AppController {
   }
 
   @Post('houses/:id/subsidy')
-  @Roles(UserRole.FARMER, UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN)
+  @Roles(UserRole.FARMER, UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN, UserRole.CIVIL_AFFAIRS)
   submitSubsidy(@Param('id') id: string, @Body() body: any, @Req() req: any) {
     return this.svc.submitSubsidy(req.user, id, body || {});
   }
 
   @Post('subsidies/:id/review')
-  @Roles(UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN)
+  @Roles(UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN, UserRole.CIVIL_AFFAIRS)
   reviewSubsidy(@Param('id') id: string, @Body() body: any, @Req() req: any) {
     return this.svc.reviewSubsidy(req.user, id, body);
   }
 
   @Post('subsidies/:id/pay')
-  @Roles(UserRole.COUNTY_ADMIN)
+  @Roles(UserRole.COUNTY_ADMIN, UserRole.CIVIL_AFFAIRS)
   paySubsidy(@Param('id') id: string, @Req() req: any) {
     return this.svc.paySubsidy(req.user, id);
   }
@@ -187,6 +189,70 @@ export class AppController {
   @Roles(UserRole.COUNTY_ADMIN, UserRole.TOWNSHIP_REVIEWER, UserRole.GRID_WORKER)
   dashboard(@Query() q: any, @Req() req: any) {
     return this.svc.dashboard(q, req.user as CurrentUser);
+  }
+
+  // ---------- 暴雨后复核 ----------
+  @Get('rain/candidates')
+  @Roles(
+    UserRole.GRID_WORKER, UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN,
+    UserRole.CADRE, UserRole.CIVIL_AFFAIRS,
+  )
+  rainCandidates(@Query() q: any, @Req() req: any) {
+    return this.svc.rainCandidates(q, req.user as CurrentUser);
+  }
+
+  @Post('rain/reports')
+  @Roles(UserRole.GRID_WORKER, UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN)
+  rainReport(@Body() body: any, @Req() req: any) {
+    return this.svc.createRainReport(req.user, body);
+  }
+
+  @Get('rain/events')
+  @Roles(
+    UserRole.GRID_WORKER, UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN,
+    UserRole.CADRE, UserRole.CIVIL_AFFAIRS, UserRole.ACCEPTOR,
+  )
+  rainEvents(@Query() q: any, @Req() req: any) {
+    return this.svc.listRainEvents(q, req.user as CurrentUser);
+  }
+
+  @Get('rain/events/:id')
+  @Roles(
+    UserRole.GRID_WORKER, UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN,
+    UserRole.CADRE, UserRole.CIVIL_AFFAIRS, UserRole.ACCEPTOR,
+  )
+  rainEvent(@Param('id') id: string) {
+    return this.svc.rainEventDetail(id);
+  }
+
+  @Post('rain/events/decide')
+  @Roles(UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN)
+  rainDecide(@Body() body: any, @Req() req: any) {
+    return this.svc.decideRainEvent(req.user, body);
+  }
+
+  @Get('rain/tasks/mine')
+  @Roles(
+    UserRole.GRID_WORKER, UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN,
+    UserRole.CADRE, UserRole.CIVIL_AFFAIRS,
+  )
+  myRainTasks(@Req() req: any) {
+    return this.svc.myRainTasks(req.user as CurrentUser);
+  }
+
+  @Post('rain/tasks/complete')
+  @Roles(
+    UserRole.GRID_WORKER, UserRole.TOWNSHIP_REVIEWER, UserRole.COUNTY_ADMIN,
+    UserRole.CADRE, UserRole.CIVIL_AFFAIRS,
+  )
+  completeRainTask(@Body() body: any, @Req() req: any) {
+    return this.svc.completeRainTask(req.user, body);
+  }
+
+  @Post('rain/rechecks')
+  @Roles(UserRole.GRID_WORKER, UserRole.ACCEPTOR, UserRole.COUNTY_ADMIN, UserRole.TOWNSHIP_REVIEWER)
+  rainRecheck(@Body() body: any, @Req() req: any) {
+    return this.svc.createRainRecheck(req.user, body);
   }
 
   // ---------- 文件上传（材料、照片）----------

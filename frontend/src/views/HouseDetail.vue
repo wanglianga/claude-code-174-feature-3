@@ -59,6 +59,10 @@
           <tab-issues :archive="a" @reload="load" />
         </el-tab-pane>
 
+        <el-tab-pane :label="rainTabLabel" name="rain">
+          <tab-rain :archive="a" @reload="load" />
+        </el-tab-pane>
+
         <el-tab-pane label="家庭 · 施工" name="build">
           <tab-construction :archive="a" @reload="load" />
         </el-tab-pane>
@@ -76,13 +80,14 @@
 </template>
 
 <script setup>
-import { onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import http from '../api';
 import { RISK, STATUS, ISSUE_TYPES, ACTIVITY_KIND, fmtDate } from '../labels';
 import TabReview from '../components/TabReview.vue';
 import TabNotice from '../components/TabNotice.vue';
 import TabIssues from '../components/TabIssues.vue';
+import TabRain from '../components/TabRain.vue';
 import TabConstruction from '../components/TabConstruction.vue';
 import TabSubsidy from '../components/TabSubsidy.vue';
 import TabAcceptance from '../components/TabAcceptance.vue';
@@ -91,6 +96,11 @@ const route = useRoute();
 const a = ref({});
 const loading = ref(false);
 const tab = ref('timeline');
+
+const openRainCount = computed(
+  () => (a.value.rainEvents || []).filter((e) => e.status !== 'RESTORED').length,
+);
+const rainTabLabel = computed(() => (openRainCount.value ? `雨后风险事件（${openRainCount.value}）` : '雨后风险事件'));
 
 function kindType(k) {
   return {

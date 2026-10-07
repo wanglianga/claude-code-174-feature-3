@@ -85,7 +85,7 @@
       </el-col>
       <el-col :span="12">
         <el-card shadow="never">
-          <template #header>基层协商成本：异常事件处置（7类）</template>
+          <template #header>基层协商成本：异常事件处置（8类）</template>
           <el-table :data="issueRows" size="small" border>
             <el-table-column label="异常类型">
               <template #default="{ row }">{{ ISSUE_TYPES[row.k] }}</template>
@@ -100,6 +100,50 @@
         </el-card>
       </el-col>
     </el-row>
+
+    <el-card shadow="never" style="margin-top:14px">
+      <template #header>
+        <div class="card-h">
+          <span>连续暴雨后复核处置（风险事件 · 同一处置任务 · 困难家庭双通道）</span>
+          <el-button link type="primary" @click="$router.push('/rain')">进雨后复核台 →</el-button>
+        </div>
+      </template>
+      <el-row :gutter="14">
+        <el-col :span="8">
+          <el-descriptions :column="1" size="small" border>
+            <el-descriptions-item label="雨后风险事件总数">{{ d.rainSummary?.total ?? 0 }} 起</el-descriptions-item>
+            <el-descriptions-item label="待处置决定">
+              <el-tag size="small" type="danger">{{ d.rainSummary?.open ?? 0 }}</el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="处置中·待复查">
+              <el-tag size="small" type="warning">{{ d.rainSummary?.disposing ?? 0 }}</el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="复查合格已关闭">{{ d.rainSummary?.restored ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="决定先转移（三方任务）">{{ d.rainSummary?.evacuate ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="72小时内反复上报升级">{{ d.rainSummary?.repeated ?? 0 }} 起</el-descriptions-item>
+          </el-descriptions>
+        </el-col>
+        <el-col :span="8">
+          <div class="bar-row"><b>同一处置任务落实情况</b></div>
+          <div v-for="r in (d.rainTaskByRole || [])" :key="r.role" class="bar-row">
+            <el-tag size="small" :class="'t-'+r.role" class="bar-label">{{ r.label }}</el-tag>
+            <el-progress :percentage="r.total ? Math.round(r.done / r.total * 100) : 0" :stroke-width="15"
+              :status="r.done === r.total ? 'success' : ''"
+              :format="() => `${r.done}/${r.total} 已办结`" />
+          </div>
+          <div class="section-hint">村干部、住建、民政收到的是同一风险事件下的同一条处置任务，处置结果回写同一档案。</div>
+        </el-col>
+        <el-col :span="8">
+          <div class="bar-row"><b>困难家庭救助双通道</b></div>
+          <el-descriptions :column="1" size="small" border>
+            <el-descriptions-item label="涉及困难家庭事件">{{ d.rainSummary?.difficult ?? 0 }} 起</el-descriptions-item>
+            <el-descriptions-item label="临时安置救助已发放">{{ d.emergencySummary?.paid ?? 0 }} 户 / ¥{{ (d.emergencySummary?.paidAmount || 0).toLocaleString() }}</el-descriptions-item>
+            <el-descriptions-item label="应急救助待复核/已批准">{{ (d.emergencySummary?.submitted ?? 0) + (d.emergencySummary?.approved ?? 0) }} 户</el-descriptions-item>
+          </el-descriptions>
+          <div class="section-hint">临时安置救助民政安置任务落实后即发；修缮补助仍须复查合格销号后发放。</div>
+        </el-col>
+      </el-row>
+    </el-card>
 
     <el-card shadow="never" style="margin-top:14px">
       <template #header>整改措施完成情况（按整改项）</template>
@@ -148,4 +192,7 @@ onMounted(async () => {
 .bar-label { width:78px; flex:none; text-align:center; }
 .bar-text { width:110px; flex:none; font-size:13px; color:#445; }
 .money { color:#f56c6c; }
+.card-h { display:flex; justify-content:space-between; align-items:center; }
+.t-CADRE_URGENT { background:#e6a23c; border-color:#e6a23c; color:#fff; }
+.t-CIVIL_AFFAIRS { background:#67c23a; border-color:#67c23a; color:#fff; }
 </style>

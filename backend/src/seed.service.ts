@@ -80,6 +80,11 @@ export class SeedService implements OnApplicationBootstrap {
     const farmer1 = await this.mkUser('farmer1', '王德福', UserRole.FARMER, '溪口镇');
     const farmer2 = await this.mkUser('farmer2', '李秀兰', UserRole.FARMER, '云岭乡');
     const farmer3 = await this.mkUser('farmer3', '张大山', UserRole.FARMER, '青山镇');
+    // 村干部（每乡镇一名）与民政（县级，困难家庭救助通道）
+    await this.mkUser('cadre1', '何平（溪口村干部）', UserRole.CADRE, '溪口镇');
+    const cadre2 = await this.mkUser('cadre2', '罗谷雨（大岭村干部）', UserRole.CADRE, '云岭乡');
+    await this.mkUser('cadre3', '何平（和平村支书）', UserRole.CADRE, '青山镇');
+    const civil = await this.mkUser('civil1', '温暖（县民政局）', UserRole.CIVIL_AFFAIRS);
 
     const teamA = await this.teams.save(
       this.teams.create({
@@ -418,6 +423,221 @@ export class SeedService implements OnApplicationBootstrap {
       });
     }
 
+    void cadre2;
+
+    // ---------- 房屋G：暴雨后两次上报升级到转移级，困难家庭双通道救助，事件处置中 ----------
+    {
+      const insp = await this.svc.createInspection(grid1, {
+        code: 'NF-XK-000007',
+        township: '溪口镇', village: '双溪村', address: '双溪村后山坳12号',
+        ownerName: '陈五保', ownerPhone: '13811110007',
+        buildYear: 1990, floors: 2, usage: '自住',
+        wallCrack: 1, roofLeak: 1, foundationSettlement: 0, residents: 3,
+        notes: '整改期房屋，后墙有明显裂缝，屋面局部渗漏',
+      });
+      const houseId = insp.house.id;
+      await this.svc.createReview(town1, {
+        inspectionId: insp.inspection.id, decision: RiskLevel.RECTIFY,
+        requirement: '加固后墙裂缝，修复屋面，雨季前完成。',
+        deadline: this.dateStr(5), // 临期
+        items: [
+          { type: 'REINFORCE_WALL', description: '后墙裂缝挂网修复加固' },
+          { type: 'REPAIR_ROOF', description: '屋面局部防水修补' },
+          { type: 'SET_WARNING', description: '屋侧边坡设置警示监测' },
+        ],
+      });
+      await this.svc.createNotice(grid1, {
+        houseId, method: '现场告知', notifiedTo: ['户主陈五保'], acknowledged: true,
+      });
+      await this.svc.upsertFamily(houseId, {
+        difficultyType: DifficultyType.LOW_INCOME,
+        difficultyProof: ['/uploads/demo-dibao-g.jpg'],
+        ownershipProof: ['/uploads/demo-quanshu-g.jpg'],
+        ownerConsent: true,
+        membersNote: '低保户，户内1名老人长期卧床，儿子打零工，抗风险能力弱',
+      });
+      await this.svc.submitConstructionPlan(farmer1, {
+        houseId, teamId: teamA.id, startDate: this.dateStr(-2), endDate: this.dateStr(4),
+        budgetItems: [
+          { name: '防水卷材', spec: 'SBS 4mm', qty: 40, unit: '㎡', unitPrice: 45 },
+          { name: '裂缝修补砂浆', spec: '', qty: 20, unit: '袋', unitPrice: 60 },
+        ],
+      });
+      const sub = await this.svc.submitSubsidy(farmer1, houseId, { amount: 3000 });
+      await this.svc.reviewSubsidy(town1, sub.application.id, { approved: true, comment: '低保户，同意修缮补助，销号后发放' });
+
+      // 连续暴雨：两次现场上报并入同一条持续升级事件
+      await this.svc.createRainReport(grid1, {
+        houseId, wallCrack: 1, roofLeak: 2, foundationSettlement: 1, residents: 3,
+        reportedAt: new Date(Date.now() - 30 * 3600000).toISOString(),
+        notes: '暴雨后渗漏加重，墙角出现沉降迹象',
+      });
+      const r2 = await this.svc.createRainReport(grid1, {
+        houseId, wallCrack: 2, roofLeak: 2, foundationSettlement: 1, residents: 3,
+        reportedAt: new Date(Date.now() - 5 * 3600000).toISOString(),
+        notes: '后墙裂缝发展为贯通斜裂，再次上报，险情持续升级',
+      });
+      const eventId = r2.event.id;
+      // 乡镇决定：先安排人员转移（不重置原整改计划，加挂转移要求）
+      await this.svc.decideRainEvent(town1, {
+        eventId, decision: 'EVACUATE', note: '贯通裂缝仍在发展，先转移3人，边坡监测，原加固方案继续执行',
+      });
+      const detail = await this.svc.rainEventDetail(eventId);
+      const cadreTask = detail.tasks.find((t) => t.taskType === 'CADRE_URGENT');
+      const civilTask = detail.tasks.find((t) => t.taskType === 'CIVIL_AFFAIRS');
+      await this.svc.completeRainTask(await this.asUserById('cadre1'), {
+        taskId: cadreTask.id, result: '已组织3人撤离至村部安置点，房屋周边拉警戒线并落实24小时巡查',
+      });
+      await this.svc.completeRainTask(civil, {
+        taskId: civilTask.id, result: '安置点床位、棉被、伙食已落实；指导该低保户同步申请临时安置救助与修缮补助',
+      });
+      await this.svc.createEvacuation(grid1, {
+        houseId, residents: 3, destination: '双溪村部安置点', rainEventId: eventId,
+        remark: '雨后紧急转移，老人优先安置',
+      });
+      // 民政应急通道：临时安置救助（与修缮补助并行，不等待销号）
+      const aid = await this.svc.submitSubsidy(civil, houseId, { aidKind: 'EMERGENCY', amount: 8000 });
+      await this.svc.reviewSubsidy(civil, aid.application.id, { approved: true, comment: '低保户紧急转移，同意临时安置救助' });
+      await this.svc.paySubsidy(civil, aid.application.id);
+      // 住建任务保留未办结：事件处于“处置中·待复查”
+    }
+
+    // ---------- 房屋H：两次上报升级暂停使用，乡镇延长整改，雨后复查不合格被阻断 ----------
+    {
+      const insp = await this.svc.createInspection(grid2, {
+        code: 'NF-YL-000008',
+        township: '云岭乡', village: '石坎村', address: '石坎村二组竹山脚',
+        ownerName: '赵竹生', ownerPhone: '13811110008',
+        buildYear: 2008, floors: 2, usage: '自住',
+        wallCrack: 0, roofLeak: 2, foundationSettlement: 0, residents: 4,
+        notes: '屋面严重渗漏，整改期内',
+      });
+      const houseId = insp.house.id;
+      await this.svc.createReview(town2, {
+        inspectionId: insp.inspection.id, decision: RiskLevel.RECTIFY,
+        requirement: '屋面防水翻修。',
+        deadline: this.dateStr(35),
+        items: [
+          { type: 'REPAIR_ROOF', description: '屋面防水层整体翻修' },
+        ],
+      });
+      await this.svc.createNotice(grid2, {
+        houseId, method: '电话告知', notifiedTo: ['户主赵竹生'], acknowledged: true,
+      });
+      await this.svc.upsertFamily(houseId, {
+        difficultyType: DifficultyType.NONE, ownershipType: '自有', ownerConsent: true,
+      });
+      await this.svc.createRainReport(grid2, {
+        houseId, wallCrack: 0, roofLeak: 2, foundationSettlement: 0, residents: 4,
+        reportedAt: new Date(Date.now() - 26 * 3600000).toISOString(),
+        notes: '暴雨后渗漏面积扩大',
+      });
+      const r2 = await this.svc.createRainReport(grid2, {
+        houseId, wallCrack: 1, roofLeak: 2, foundationSettlement: 0, residents: 4,
+        reportedAt: new Date(Date.now() - 6 * 3600000).toISOString(),
+        notes: '山墙出现明显裂缝，需继续观察但暂不需转移',
+      });
+      // 乡镇决定：延长整改期限（原计划继续，仅延期）
+      await this.svc.decideRainEvent(town2, {
+        eventId: r2.event.id, decision: 'EXTEND',
+        newDeadline: this.dateStr(60), note: '连续暴雨导致屋面无法施工，顺延工期，加密裂缝监测',
+      });
+      // 雨后复查不合格：事件继续处置，验收/销号被阻断
+      await this.svc.createRainRecheck(acceptor, {
+        eventId: r2.event.id, result: AcceptanceResult.FAIL, wallCrack: 1, roofLeak: 2,
+        notes: '裂缝尚未稳定，渗漏仍存在，不具备恢复条件',
+      });
+    }
+
+    // ---------- 房屋I：三次反复上报升级转移，处置到位后复查合格，恢复原等级继续整改 ----------
+    {
+      const insp = await this.svc.createInspection(grid3, {
+        code: 'NF-QS-000009',
+        township: '青山镇', village: '柳湾村', address: '柳湾村水渠边3号',
+        ownerName: '林巧妹', ownerPhone: '13811110009',
+        buildYear: 1998, floors: 2, usage: '自住',
+        wallCrack: 1, roofLeak: 1, foundationSettlement: 0, residents: 2,
+        notes: '墙体明显裂缝，整改施工中',
+      });
+      const houseId = insp.house.id;
+      const plan = await this.svc.createReview(town3, {
+        inspectionId: insp.inspection.id, decision: RiskLevel.RECTIFY,
+        requirement: '加固开裂墙体，修复屋面。',
+        deadline: this.dateStr(30),
+        items: [
+          { type: 'REINFORCE_WALL', description: '承重墙钢筋网抹面加固' },
+          { type: 'REPAIR_ROOF', description: '屋面防水修复' },
+        ],
+      });
+      await this.svc.createNotice(grid3, {
+        houseId, method: '现场告知', notifiedTo: ['户主林巧妹'], acknowledged: true,
+      });
+      await this.svc.upsertFamily(houseId, {
+        difficultyType: DifficultyType.NONE, ownershipType: '自有', ownerConsent: true,
+      });
+      await this.svc.submitConstructionPlan(farmer3, {
+        houseId, teamId: teamA.id, startDate: this.dateStr(-5), endDate: this.dateStr(20),
+        budgetItems: [
+          { name: '商品混凝土', spec: 'C30', qty: 6, unit: 'm³', unitPrice: 480 },
+          { name: '防水卷材', spec: 'SBS 4mm', qty: 50, unit: '㎡', unitPrice: 45 },
+        ],
+      });
+      await this.svc.addConstructionLog(teamUser, {
+        houseId, stage: '墙体加固', content: '暴雨前已完成一面墙挂网', progressPercent: 30,
+        itemId: plan.items[0].id, itemStatus: ItemStatus.IN_PROGRESS,
+      });
+      // 三天内三次上报，事件持续升级至紧急转移
+      await this.svc.createRainReport(grid3, {
+        houseId, wallCrack: 1, roofLeak: 2, foundationSettlement: 0, residents: 2,
+        reportedAt: new Date(Date.now() - 60 * 3600000).toISOString(),
+        notes: '暴雨后渗漏加重，第1次上报',
+      });
+      await this.svc.createRainReport(grid3, {
+        houseId, wallCrack: 1, roofLeak: 2, foundationSettlement: 1, residents: 2,
+        reportedAt: new Date(Date.now() - 40 * 3600000).toISOString(),
+        notes: '墙脚新增沉降，第2次上报',
+      });
+      const r3 = await this.svc.createRainReport(grid3, {
+        houseId, wallCrack: 2, roofLeak: 2, foundationSettlement: 1, residents: 2,
+        reportedAt: new Date(Date.now() - 10 * 3600000).toISOString(),
+        notes: '裂缝贯通，第3次上报，要求转移',
+      });
+      const eventId = r3.event.id;
+      await this.svc.decideRainEvent(town3, {
+        eventId, decision: 'EVACUATE', note: '反复上报险情持续发展，先转移，原加固方案不重置',
+      });
+      const detail = await this.svc.rainEventDetail(eventId);
+      for (const t of detail.tasks) {
+        const u = t.taskType === 'CADRE_URGENT'
+          ? await this.asUserById('cadre3')
+          : t.taskType === 'CIVIL_AFFAIRS'
+            ? civil
+            : town3;
+        await this.svc.completeRainTask(u, {
+          taskId: t.id,
+          result: t.taskType === 'CADRE_URGENT'
+            ? '2人已投亲靠友临时安置，现场警戒到位'
+            : t.taskType === 'CIVIL_AFFAIRS'
+              ? '临时安置点与生活保障落实，该户非困难家庭，登记备用救助渠道'
+              : '已封停核查，原墙体加固方案调整配筋后继续施工，未重置整改状态',
+        });
+      }
+      await this.svc.createEvacuation(grid3, {
+        houseId, residents: 2, destination: '投亲靠友', rainEventId: eventId,
+      });
+      // 雨后复查合格：恢复事件前风险等级与“整改中”状态，事件关闭，可继续验收销号
+      await this.svc.createRainRecheck(grid3, {
+        eventId, result: AcceptanceResult.PASS, wallCrack: 1, roofLeak: 1, foundationSettlement: 0,
+        notes: '加固完成后裂缝稳定，沉降无发展，具备恢复条件',
+      });
+    }
+
     void teamB;
+  }
+
+  private async asUserById(username: string): Promise<CurrentUser> {
+    const u = await this.users.findOne({ where: { username } });
+    if (!u) throw new Error(`种子账号不存在: ${username}`);
+    return this.asUser(u);
   }
 }

@@ -1,7 +1,10 @@
 <template>
   <div>
-    <el-alert title="补助闭环：困难类型+证明、权属证明、户主同意、方案告知、高风险停用/转移、预算明细、施工队资质——8项全部通过才进入乡镇复核；批准后也必须在验收销号后才能发放；存在补助资格争议未办结的不得批准。"
+    <el-alert title="补助闭环：困难类型+证明、权属证明、户主同意、方案告知、高风险停用/转移、预算明细、施工队资质——8项全部通过才进入乡镇复核；批准后也必须在复查合格销号后才能发放；存在补助资格争议未办结的不得批准。"
       type="warning" :closable="false" show-icon style="margin-bottom:12px" />
+
+    <el-alert v-if="archive.emergencyAid" type="success" :closable="false" show-icon style="margin-bottom:12px"
+      :title="`困难家庭双通道：另有一笔临时安置救助 ¥${Number(archive.emergencyAid.amount).toLocaleString()}（${SUBSIDY_STATUS[archive.emergencyAid.status].label}）——民政安置任务落实后发放，不等待工程销号；详见“雨后风险事件”页签`" />
 
     <el-row :gutter="12">
       <el-col :span="14">

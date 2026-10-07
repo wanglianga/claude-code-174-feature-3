@@ -11,6 +11,8 @@ import {
   ConstructionPlan,
   ConstructionTeam,
   Consultation,
+  DispositionAssignee,
+  DispositionTask,
   EvacuationRecord,
   FamilyProfile,
   House,
@@ -18,6 +20,8 @@ import {
   Inspection,
   IssueRecord,
   NoticeRecord,
+  RainEvent,
+  RainReport,
   RectificationItem,
   RecheckRecord,
   ReviewPlan,
@@ -35,7 +39,7 @@ const entities = [
   User, House, Inspection, ReviewPlan, RectificationItem, NoticeRecord, EvacuationRecord,
   Stakeholder, Consultation, IssueRecord, FamilyProfile, ConstructionTeam, ConstructionPlan,
   BudgetItem, SubsidyApplication, ConstructionLog, Acceptance, AcceptanceItemResult,
-  CloseRecord, RecheckRecord, HouseActivity,
+  CloseRecord, RecheckRecord, HouseActivity, RainEvent, RainReport, DispositionTask, DispositionAssignee,
 ];
 
 @Module({
